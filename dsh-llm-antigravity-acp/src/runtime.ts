@@ -9,32 +9,62 @@
 
 import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { LlmError } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, RequestMessage, StreamChunk, ToolSchema } from '@deepseek-ai/dsh-llm'
-import { AcpProcess, type AcpConfigOption, type AcpPermissionOutcome, type AcpPermissionRequest, type AcpPromptResult, type AcpSessionUpdate, type AcpSpawner, type AcpToolCallMeta } from './acp-process.ts'
-import { ModelCatalog, nearestEffort } from './catalog.ts'
-import { asEffort, current, type Config, type Effort } from './config.ts'
-import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, pumpStep, relayNotice, type ParkedCall } from './conversation.ts'
+import { AcpProcess, type AcpChild, type AcpConfigOption, type AcpPermissionOutcome, type AcpPermissionRequest, type AcpPromptResult, type AcpSpawner } from './acp-process.ts'
 import {
-  AGENT_TOOL_PREFIX, bridgeSystemPrompt, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES, MCP_SERVER_NAME, renderTranscript,
-  replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES, type AcpPromptBlock, type ImageResolver,
+  applyModelAndEffort, detachBridge, freshReanswer, historyPrefixIntact, isOwnMessage, MAIN_PURPOSE, mountBridge,
+  pendingInput, permissionState, planPrompt,
+  type Conversation,
+} from './acp-session.ts'
+import {
+  AccountPool, accountProfileOf, accountVisibleModels, buildLayouts, ensureLayout, familyForModel, loginCommand, pluginHome, proxyUrlFromEnv, readAccountEmail,
+  SYSTEM_ACCOUNT_ID, TRANSIENT_COOLDOWN_MS, type AccountAdmin, type AccountLayout, type AccountStatus,
+  type CooldownKey, type Family, type LoginResult, type LoginTicket,
+} from './accounts.ts'
+import { ModelCatalog, intersectVisible, isListedModel, nearestEffort, type AvailableModel, type CatalogModel } from './catalog.ts'
+import { asEffort, current, type AccountProfile, type Config, type Effort } from './config.ts'
+import { AcpTurn, AWAIT_TOOL, AWAIT_TOOL_NAME, CALL_TOOL, CALL_TOOL_NAME, degradedExhaustedError, degradedRouteError, isReanswerFailure, pumpStep, relayNotice, type ParkedCall } from './conversation.ts'
+import { unlockAccountKeychain } from './credential.ts'
+import {
+  AGENT_TOOL_PREFIX, inputPrompt, LOCKED_REPLAY_BUDGET_BYTES,
+  renderFullToolContracts, renderTranscript, replayPrompt, splitSystem, UNLOCKED_REPLAY_BUDGET_BYTES,
+  type AcpPromptBlock, type ImageResolver,
 } from './history.ts'
+import { labeled } from './labels.ts'
 import { JsonRpcClosedError, JsonRpcRemoteError } from './jsonrpc.ts'
 import { McpBridge, type BridgeCallRequest, type BridgeContent, type BridgeTool, type BridgeToolResult } from './mcp-bridge.ts'
 import {
-  assertSupportedAgyVersion, BRIDGE_AGENT, checkUnlock, defaultHome, defaultPatchScript, GPT_OSS_CONTEXT_WINDOW,
-  LOCKED_CONTEXT_WINDOW, prepareHome, readVersion, resolveAgyBinary, syncOAuthToken, UNLOCKED_CONTEXT_WINDOW,
-  type CommandRunner, type PreflightResult,
+  assertSupportedAgyVersion, BRIDGE_AGENT, checkUnlock, defaultPatchScript, GPT_OSS_CONTEXT_WINDOW, LOCKED_CONTEXT_WINDOW,
+  readVersion, resolveAgyBinary, syncOAuthToken, UNLOCKED_CONTEXT_WINDOW, type CommandRunner, type PreflightResult,
 } from './preflight.ts'
-import { QuotaReader } from './quota.ts'
-import { peekMaxModelStepIdx, readModelStepsAfter, sessionDbPath } from './usage-db.ts'
+import { groupForModel, isWeeklyBucket, QuotaReader, resolveModelQuota, type QuotaSnapshot } from './quota.ts'
+import { RouteHealth, type RouteHealthSnapshot } from './route-health.ts'
+import { SessionStore } from './session-store.ts'
+import { newSlot, rebaseSlot, slotDeniesModel, slotDisablesModel, type AccountSlot } from './slots.ts'
+import {
+  answerPermission as decidePermission, consumeToolDelta, resolveActiveToolSchemas, toBridgeTools,
+  MAX_EAGER_BRIDGE_TOOL_BYTES,
+} from './tool-bridge.ts'
+import {
+  hasGenMetadata, peekMaxGenMetadataIdx, peekMaxModelStepIdx,
+  readGenUsageAfter, readModelStepTail, readModelStepsAfter, sessionDbPath,
+  type DegradeFingerprintResult,
+} from './usage-db.ts'
 import { delay, digest, KeyedMutex } from './util.ts'
+
+// The tool-bridge helpers stay importable from this module for existing consumers.
+export { compactBridgeTool, consumeToolDelta, MAX_EAGER_BRIDGE_TOOL_BYTES, resolveActiveToolSchemas } from './tool-bridge.ts'
 
 /** Parked calls answer with a still-running notice before Gemini cache TTL expiry and agy's 180-second MCP deadline. */
 export const DEFAULT_RELAY_AFTER_MS = 85_000
+/** Automatic re-answers granted for one identical request before a degraded answer is delivered as it is. */
+const MAX_REANSWERS_PER_REQUEST = 2
+/** Failure text of a provider whose account list is empty, which only the settings page can fix. */
+const NO_ACCOUNT_MESSAGE = '没有可用的 Antigravity 账号，请在设置页添加账号或使用本机登录。'
 const CONTINUE_PROMPT = 'Continue exactly where your previous output stopped. Do not repeat any earlier text.'
-const MAIN_PURPOSE = 'main'
+const REROLL_CONTINUATION_PROMPT = '[HARNESS_NOTICE] Your previous attempt was discarded before reaching the user because upstream routed it to a degraded fallback node without executing any tools. Disregard any prior unexecuted draft, inspect the full context and workspace with your tools as needed, and complete my latest request above from scratch.'
 
 /** Host services the runtime uses. */
 export interface RuntimeHost {
@@ -55,6 +85,24 @@ export interface LiveOverrides {
   contextWindow?: number
   defaultEffort?: Effort
   longDecodeContinuations?: number
+  /**
+   * Replace the whole account list, the machine account included as its
+   * `system: true` entry. A list without one means the machine account was
+   * removed.
+   */
+  accounts?: AccountProfile[]
+  /**
+   * Provider-level model allowlist: empty offers every advertised family, a
+   * non-empty list offers only those ids. Applied live, without a new ACP
+   * session, because the catalog keeps the advertised set.
+   */
+  visibleModels?: string[]
+}
+
+/** Per-session route health diagnostic reported to `QuotaPill`. */
+export interface SessionHealthStatus extends RouteHealthSnapshot {
+  sessionId: string
+  acpSessionId: string
 }
 
 /** Snapshot reported to the settings page and quota pill. */
@@ -70,67 +118,47 @@ export interface RuntimeStatus {
   defaultEffort: Effort
   longDecodeContinuations: number
   models: { id: string; name: string }[]
+  /** Every advertised family with the visibility the current allowlist gives it. */
+  availableModels: { id: string; name: string; enabled: boolean }[]
+  /** Provider-level allowlist; empty means every advertised family. */
+  visibleModels: string[]
   efforts: string[]
   liveSessions: number
   activeTurns: number
+  /** Every configured account with its live process state and cooldowns. */
+  accounts: AccountStatus[]
+  /** Account that served the most recent step. */
+  lastAccount?: string
   lastTurn?: { model: string; effort: string; steps: number; usage?: AcpPromptResult['usage']; at: string }
+  /** Route-health diagnostics keyed by DSH `sessionId`. */
+  sessionHealth?: Record<string, SessionHealthStatus>
 }
 
-/** Structured MCP metadata the agent reported for one tool call. */
-interface ReportedToolCall {
-  kind?: string
-  serverName?: string
-  toolName?: string
-  /** Set when later updates contradicted an already established field. */
-  conflict?: boolean
+/** One ACP turn's write-back context. */
+interface PumpContext {
+  nextKnownIds: string[]
 }
 
-interface Conversation {
-  readonly key: string
-  readonly purpose: string
-  tenantKey: string | undefined
-  /** Per-tenant bearer credential presented by the agent on the MCP bridge. */
-  tenantSecret: string | undefined
-  sessionId: string | undefined
-  process: AcpProcess | undefined
-  configOptions: AcpConfigOption[]
-  systemHash: string | undefined
-  advertisedTools: BridgeTool[]
-  advertisedToolNames: Set<string>
-  knownTools: Map<string, string>
-  toolNames: Set<string>
-  /** Tool calls the agent reported via `session/update` — the only trusted permission source. */
-  reportedToolCalls: Map<string, ReportedToolCall>
-  /** True while this conversation is being acquired or its session is opening; never evicted as idle. */
-  opening: boolean
-  usageCursor: number
-  knownIds: string[] | undefined
-  issuedIds: Set<string>
-  turn: AcpTurn | undefined
-  dirty: boolean
-  lastUsed: number
-  model: string | undefined
-  effort: Effort | undefined
+/** One interactive sign-in waiting for its authorization code. */
+interface LoginSession {
+  child: AcpChild
+  url: string
 }
 
-interface PromptPlan {
-  rebuild: boolean
-  history: readonly RequestMessage[]
-  input: readonly RequestMessage[]
-}
-
-/** Owner of the ACP process, the MCP bridge, and every conversation. */
-export class AntigravityRuntime {
+/** Owner of the ACP processes, the MCP bridge, and every conversation. */
+export class AntigravityRuntime implements AccountAdmin {
   readonly bridge: McpBridge
   readonly catalog: ModelCatalog
   readonly quota: QuotaReader
-  private readonly home: string
-  private process: AcpProcess | undefined
-  private starting: Promise<AcpProcess> | undefined
-  private preflight: PreflightResult | undefined
-  private preflightPromise: Promise<PreflightResult> | undefined
-  private state: RuntimeStatus['state'] = 'idle'
+  /** Gemini home of the account that owns the shared model catalog. */
+  private readonly primaryHome: string
+  private readonly sessions: SessionStore
+  private readonly pool: AccountPool
+  private readonly slots = new Map<string, AccountSlot>()
+  private readonly logins = new Map<string, LoginSession>()
+  private binary: string | undefined
   private lastError: string | undefined
+  private lastAccount: string | undefined
   private readonly conversations = new Map<string, Conversation>()
   private readonly tenants = new Map<string, Conversation>()
   /** Per-turn call-id tags already issued or observed in history; keeps `<rootCallId>:ptc:<n>` unique session-wide. */
@@ -138,6 +166,8 @@ export class AntigravityRuntime {
   private readonly mutex = new KeyedMutex()
   /** Serializes capacity checks and session creation so concurrent requests cannot overshoot maxLiveSessions. */
   private readonly capacityMutex = new KeyedMutex()
+  /** Serializes pre-execution `gen_metadata` checks for parallel tool calls within the same conversation. */
+  private readonly gateMutex = new KeyedMutex()
   private sweeper: ReturnType<typeof setInterval> | undefined
   private lastTurn: RuntimeStatus['lastTurn']
   private overrides: LiveOverrides = {}
@@ -145,16 +175,74 @@ export class AntigravityRuntime {
 
   /** @param host - host services. */
   constructor(private readonly host: RuntimeHost) {
-    this.home = host.config.home.length > 0 ? host.config.home : defaultHome()
-    this.catalog = new ModelCatalog(join(this.home, 'catalog.json'))
+    const layouts = this.resolveLayouts(host.config)
+    this.pool = new AccountPool(layouts)
+    for (const layout of layouts) {
+      this.slots.set(layout.id, newSlot(layout))
+    }
+    // The plugin's own data (session index, catalog cache) lives in the primary
+    // account's directory when there is one. A provider with no account at all
+    // keeps it under the plugin home, so a list the user emptied still boots and
+    // can gain an account from the settings page afterwards.
+    this.primaryHome = (this.pool.get(SYSTEM_ACCOUNT_ID) ?? layouts[0])?.geminiDir ?? pluginHome(host.config.home)
+    this.sessions = new SessionStore(join(this.primaryHome, 'session-index.json'))
+    this.catalog = new ModelCatalog(join(this.primaryHome, 'catalog.json'))
+    this.catalog.applyVisibility(this.providerVisible())
     this.bridge = new McpBridge({
       listTools: tenantKey => this.listTools(tenantKey),
       callTool: request => this.callTool(request),
       authorize: (tenantKey, bearerToken) => this.authorizeTenant(tenantKey, bearerToken),
     }, { keepAliveMs: host.config.keepAliveMs, log: message => host.log.info(message) })
-    this.quota = new QuotaReader(() => this.preflight?.binary, host.runCommand, host.config.quotaTtlMs)
+    this.quota = new QuotaReader(() => this.binary, host.runCommand, host.config.quotaTtlMs)
+    void this.refreshAccountEmails()
     this.sweeper = setInterval(() => this.sweep(), 60_000)
     this.sweeper.unref?.()
+  }
+
+  /**
+   * Record the binding of one conversation so a later process can resume it.
+   * Only a main conversation that is clean and fully identified is durable.
+   * @param conv - the conversation to record.
+   */
+  private persistConversation(conv: Conversation): void {
+    if (
+      conv.purpose !== MAIN_PURPOSE
+      || conv.dshSessionId === undefined
+      || conv.key.startsWith('anon-')
+      || conv.sessionId === undefined
+      || conv.accountId === undefined
+      || conv.systemHash === undefined
+      || conv.knownIds === undefined
+      || conv.dirty
+    ) {
+      return
+    }
+    this.sessions.save(conv.dshSessionId, {
+      acpSessionId: conv.sessionId,
+      accountId: conv.accountId,
+      systemHash: conv.systemHash,
+      knownIds: [...conv.knownIds],
+      advertisedTools: conv.advertisedTools.map(t => ({ ...t })),
+      knownTools: [...conv.knownTools.entries()],
+      issuedIds: [...conv.issuedIds],
+    })
+  }
+
+  /**
+   * Build the account layouts, degrading to the machine account when the
+   * declared list is malformed: one bad entry must not take the provider down.
+   */
+  private resolveLayouts(config: Config): AccountLayout[] {
+    const accounts = this.overrides.accounts ?? current(config.accounts) ?? []
+    try {
+      return buildLayouts({ home: config.home, accounts })
+    } catch (error) {
+      this.host.log.warn(`antigravity-acp: ${error instanceof Error ? error.message : String(error)}; falling back to the machine account only`)
+      return buildLayouts({
+        home: config.home,
+        accounts: [{ id: SYSTEM_ACCOUNT_ID, displayName: '', home: '', enabled: true, env: {}, contextWindow: 0, system: true, visibleModels: [] }],
+      })
+    }
   }
 
   /** Configured context window (0 = auto). */
@@ -169,20 +257,32 @@ export class AntigravityRuntime {
   contextWindow(): number {
     const configured = this.configuredContextWindow()
     if (configured > 0) return configured
-    return this.preflight?.unlock.status === 'unlocked' ? UNLOCKED_CONTEXT_WINDOW : LOCKED_CONTEXT_WINDOW
+    return this.primaryPreflight()?.unlock.status === 'unlocked' ? UNLOCKED_CONTEXT_WINDOW : LOCKED_CONTEXT_WINDOW
   }
 
   /**
-   * Declared context window of one family. Claude 5.5 shares the 1M pool when
+   * Declared context window of one family: a global default, narrowed by every
+   * account that can serve the model. An account may only shrink the window,
+   * never widen it beyond the global value. Claude 5.5 shares the 1M pool when
    * the binary is unlocked; GPT-OSS 120B keeps its own 128K-class window.
    * @param model - family id.
    * @returns tokens.
    */
   contextWindowFor(model: string): number {
+    const fallback = this.baseContextWindow(model)
+    const candidates = this.pool.list().filter(layout => layout.enabled && this.servesModel(layout.id, model))
+    if (candidates.length === 0) return fallback
+    const windows = candidates.map(layout => layout.contextWindow > 0 ? Math.min(layout.contextWindow, fallback) : fallback)
+    return Math.min(...windows)
+  }
+
+  private baseContextWindow(model: string): number {
     const configured = this.configuredContextWindow()
     if (configured > 0) return configured
     if (model.startsWith('gpt-oss')) return GPT_OSS_CONTEXT_WINDOW
-    return this.preflight?.unlock.status === 'unlocked' ? UNLOCKED_CONTEXT_WINDOW : LOCKED_CONTEXT_WINDOW
+    const discovered = this.catalog.maxTokensFor(model)
+    const ceiling = this.primaryPreflight()?.unlock.status === 'unlocked' ? UNLOCKED_CONTEXT_WINDOW : LOCKED_CONTEXT_WINDOW
+    return discovered !== undefined && discovered > 0 ? Math.min(discovered, ceiling) : ceiling
   }
 
   /**
@@ -208,15 +308,193 @@ export class AntigravityRuntime {
     return this.overrides.longDecodeContinuations ?? current(this.host.config.longDecodeContinuations)
   }
 
+  /** Provider-level model allowlist; empty offers every advertised family. */
+  providerVisible(): string[] {
+    return accountVisibleModels(this.overrides.visibleModels ?? current(this.host.config.visibleModels))
+  }
+
+  /**
+   * Model ids one account may serve.
+   * @param accountId - account key, or undefined for the provider ceiling.
+   * @returns the effective ids; empty means every advertised family.
+   */
+  effectiveVisible(accountId?: string): string[] {
+    const provider = this.providerVisible()
+    if (accountId === undefined) return provider
+    const layout = this.slots.get(accountId)?.layout
+    if (layout === undefined) return provider
+    return intersectVisible(provider, accountVisibleModels(layout.visibleModels))
+  }
+
+  /**
+   * Whether an account may serve one family.
+   * @param accountId - account key, or undefined for the provider ceiling.
+   * @param model - family id.
+   * @returns true when the provider and the account both offer it.
+   */
+  servesModel(accountId: string | undefined, model: string): boolean {
+    const provider = this.providerVisible()
+    if (!isListedModel(model, provider)) return false
+    if (accountId === undefined) return true
+    const layout = this.slots.get(accountId)?.layout
+    if (layout === undefined) return true
+    return isListedModel(model, accountVisibleModels(layout.visibleModels))
+  }
+
   /**
    * Apply live runtime settings immediately and notify catalog observers.
    * @param patch - updated fields.
    * @returns updated status.
    */
   configure(patch: LiveOverrides): RuntimeStatus {
-    this.overrides = { ...this.overrides, ...patch }
+    const next: LiveOverrides = { ...patch }
+    if (next.visibleModels !== undefined) next.visibleModels = accountVisibleModels(next.visibleModels)
+    let accounts = next.accounts
+    if (accounts !== undefined) {
+      const declared = accounts
+      // Re-resolve through the layouts so auto-assigned ids and normalized
+      // remarks are what gets stored, and the machine entry keeps `system`.
+      accounts = buildLayouts({ home: this.host.config.home, accounts: declared }).map((layout, index) => accountProfileOf(
+        layout,
+        layout.system ? declared[index]?.displayName : undefined,
+      ))
+    }
+    this.overrides = { ...this.overrides, ...next, ...accounts !== undefined ? { accounts } : {} }
+    if (next.accounts !== undefined) this.applyAccounts()
+    if (next.visibleModels !== undefined) this.catalog.applyVisibility(this.providerVisible())
     this.host.onModelsChanged()
     return this.status()
+  }
+
+  private applyAccounts(): void {
+    const layouts = this.resolveLayouts(this.host.config)
+    this.pool.sync(layouts)
+    const live = new Set(layouts.map(layout => layout.id))
+    for (const [id, slot] of [...this.slots]) {
+      if (live.has(id)) continue
+      for (const conv of this.conversations.values()) {
+        if (conv.accountId !== id) continue
+        void this.resetSession(conv)
+        conv.accountId = undefined
+      }
+      slot.process?.stop()
+      this.slots.delete(id)
+    }
+    for (const layout of layouts) {
+      const slot = this.slots.get(layout.id)
+      if (slot === undefined) {
+        this.slots.set(layout.id, newSlot(layout))
+        continue
+      }
+      if (rebaseSlot(slot, layout) && slot.process !== undefined) {
+        slot.process.stop()
+        slot.process = undefined
+        slot.starting = undefined
+        slot.state = 'idle'
+      }
+    }
+    this.quota.clear()
+    this.recomputeUnionCatalog()
+    void this.refreshAccountEmails()
+  }
+
+  private applyQuotaToSlot(slot: AccountSlot, snapshot: QuotaSnapshot): void {
+    if (snapshot.subscriptionTier !== undefined) slot.subscriptionTier = snapshot.subscriptionTier
+    if (snapshot.subscriptionName !== undefined) slot.subscriptionName = snapshot.subscriptionName
+    if (snapshot.disabledModels !== undefined) slot.disabledModels = [...snapshot.disabledModels]
+    if (snapshot.effortsByModel !== undefined) slot.effortsByModel = { ...snapshot.effortsByModel }
+    if (snapshot.maxTokensByModel !== undefined) slot.maxTokensByModel = { ...snapshot.maxTokensByModel }
+    if (snapshot.availableModels !== undefined && snapshot.availableModels.length > 0) {
+      slot.availableModels = snapshot.availableModels.map(m => ({ ...m }))
+    }
+    for (const group of snapshot.groups) {
+      const weekly = group.buckets.find(b => isWeeklyBucket(b) && !b.disabled)
+      if (weekly !== undefined && weekly.remainingFraction <= 0.005 && weekly.resetTime.length > 0) {
+        const key: CooldownKey = group.kind === 'argon'
+          ? 'argon'
+          : (group.kind === 'claude' ? 'claude' : 'gemini')
+        this.pool.exhaustFor(slot.layout.id, key, weekly.resetTime)
+        if (key === 'claude') this.pool.exhaustFor(slot.layout.id, 'gpt-oss', weekly.resetTime)
+      }
+    }
+    if (this.recomputeUnionCatalog()) this.host.onModelsChanged()
+  }
+
+  private recomputeUnionCatalog(): boolean {
+    const inventories: CatalogModel[][] = []
+    const effortsByModel: Record<string, Effort[]> = {}
+    const maxTokensByModel: Record<string, number> = {}
+    for (const slot of this.slots.values()) {
+      if (!slot.layout.enabled || slot.availableModels === undefined || slot.availableModels.length === 0) continue
+      inventories.push(slot.availableModels)
+      for (const [id, efforts] of Object.entries(slot.effortsByModel ?? {})) {
+        if (effortsByModel[id] === undefined || efforts.length > effortsByModel[id].length) {
+          effortsByModel[id] = [...efforts]
+        }
+      }
+      for (const [id, maxTokens] of Object.entries(slot.maxTokensByModel ?? {})) {
+        maxTokensByModel[id] = Math.max(maxTokensByModel[id] ?? 0, maxTokens)
+      }
+    }
+    if (inventories.length === 0) return false
+    return this.catalog.mergeAccountInventories(inventories, effortsByModel, maxTokensByModel, this.providerVisible())
+  }
+
+  private observeSlotCatalog(
+    slot: AccountSlot,
+    options: readonly AcpConfigOption[] | undefined,
+    available?: readonly AvailableModel[],
+  ): void {
+    const modelOption = options?.find(o => o.id === 'model' || o.category === 'model')
+    if (modelOption?.options !== undefined && modelOption.options.length > 0) {
+      slot.availableModels = modelOption.options.map(o => ({ id: o.value, name: o.name ?? o.value }))
+      if (available !== undefined && available.length > 0) {
+        const map: Record<string, Effort[]> = { ...(slot.effortsByModel ?? {}) }
+        for (const model of slot.availableModels) {
+          const offered = (['low', 'medium', 'high'] as const).filter(e => available.some(a => a.modelId === `${model.id}-${e}`))
+          map[model.id] = [...offered]
+        }
+        slot.effortsByModel = map
+      }
+      if (this.recomputeUnionCatalog()) {
+        this.host.onModelsChanged()
+        return
+      }
+    }
+    if (this.catalog.observe(options, available, this.providerVisible())) {
+      this.host.onModelsChanged()
+    }
+  }
+
+  /**
+   * Read the stored email and upstream Cloud Code tier/catalog/quota of every
+   * configured account so newly added or restarted slots display their real
+   * subscription tier and entitled models immediately.
+   */
+  async refreshAccountEmails(): Promise<void> {
+    await Promise.all([...this.slots.values()].map(async (slot) => {
+      const email = await readAccountEmail(slot.layout, this.host.runCommand).catch(() => undefined)
+      slot.email = email
+      if (email !== undefined && email.length > 0) {
+        const snap = await this.quota.readFor(slot.layout.id, slot.env, false, slot.layout).catch(() => undefined)
+        if (snap !== undefined && snap.status === 'ok') {
+          this.applyQuotaToSlot(slot, snap)
+        }
+      }
+    }))
+  }
+
+  private primaryPreflight(): PreflightResult | undefined {
+    for (const slot of this.slots.values()) if (slot.preflight !== undefined) return slot.preflight
+    return undefined
+  }
+
+  private overallState(): RuntimeStatus['state'] {
+    const states = [...this.slots.values()].map(slot => slot.state)
+    if (states.includes('ready')) return 'ready'
+    if (states.includes('starting')) return 'starting'
+    if (states.includes('error')) return 'error'
+    return 'idle'
   }
 
   /**
@@ -224,66 +502,392 @@ export class AntigravityRuntime {
    * @returns the status snapshot.
    */
   status(): RuntimeStatus {
+    const preflight = this.primaryPreflight()
+    const sessionHealth = this.collectSessionHealth()
     return {
-      state: this.state,
+      state: this.overallState(),
       ...this.lastError !== undefined ? { error: this.lastError } : {},
-      ...this.preflight !== undefined ? {
-        binary: this.preflight.binary,
-        version: this.preflight.version,
-        home: this.preflight.home,
-        unlock: this.preflight.unlock,
+      ...preflight !== undefined ? {
+        binary: preflight.binary,
+        version: preflight.version,
+        home: preflight.home,
+        unlock: preflight.unlock,
       } : {},
       contextWindow: this.contextWindow(),
       configuredContextWindow: this.configuredContextWindow(),
       defaultEffort: this.defaultEffort(),
       longDecodeContinuations: this.longDecodeContinuations(),
       models: this.catalog.list().map(m => ({ ...m })),
+      availableModels: this.catalog.availableModels().map(m => ({ ...m })),
+      visibleModels: this.providerVisible(),
       efforts: [...this.catalog.effortList()],
       liveSessions: [...this.conversations.values()].filter(c => c.sessionId !== undefined).length,
       activeTurns: [...this.conversations.values()].filter(c => c.turn !== undefined && !c.turn.finished).length,
+      accounts: this.accounts(),
+      ...this.lastAccount !== undefined ? { lastAccount: this.lastAccount } : {},
       ...this.lastTurn !== undefined ? { lastTurn: this.lastTurn } : {},
+      ...Object.keys(sessionHealth).length > 0 ? { sessionHealth } : {},
     }
   }
 
   /**
-   * Run preflight and start the ACP process.
-   * @returns the running process.
+   * Read the live shadow-degradation health snapshot of one DSH session.
+   * @param dshSessionId - DSH session id.
+   * @returns health status when recorded, otherwise `undefined`.
    */
-  async ensureReady(): Promise<AcpProcess> {
-    if (this.disposed) throw new LlmError('Antigravity provider was disposed', 'TRANSPORT')
-    if (this.process?.alive === true) return this.process
-    this.starting ??= this.start().finally(() => { this.starting = undefined })
-    return this.starting
+  sessionHealthFor(dshSessionId: string): SessionHealthStatus | undefined {
+    return this.collectSessionHealth()[dshSessionId]
+  }
+
+  private collectSessionHealth(): Record<string, SessionHealthStatus> {
+    const out: Record<string, SessionHealthStatus> = {}
+    for (const conv of this.conversations.values()) {
+      if (conv.purpose !== MAIN_PURPOSE || conv.dshSessionId === undefined || conv.sessionId === undefined) continue
+      const health = conv.health.snapshot()
+      if (health === undefined) continue
+      out[conv.dshSessionId] = { sessionId: conv.dshSessionId, acpSessionId: conv.sessionId, ...health }
+    }
+    return out
   }
 
   /**
-   * Warm the process and refresh the catalog through a tool-less discovery session.
-   * @returns resolves when discovery finished.
+   * Plan quota of one account, read through that account's own credential store.
+   * @param accountId - account to read; defaults to the account that served the last step.
+   * @param force - bypass the cache.
+   * @returns the quota snapshot.
    */
-  async warmup(): Promise<void> {
-    const proc = await this.ensureReady()
-    const result = await proc.newSession({
-      cwd: this.preflight?.workspace ?? this.home,
-      mcpServers: [],
-    }, { onUpdate: () => undefined }, 120_000)
-    if (this.catalog.observe(result.configOptions, result.models?.availableModels)) this.host.onModelsChanged()
-    await proc.closeSession(result.sessionId)
+  async quotaFor(accountId: string | undefined, force = false): Promise<QuotaSnapshot> {
+    const id = accountId ?? this.lastAccount ?? SYSTEM_ACCOUNT_ID
+    const slot = this.slots.get(id)
+    if (this.binary === undefined) {
+      const target = slot ?? this.slots.get(SYSTEM_ACCOUNT_ID) ?? [...this.slots.values()][0]
+      if (target !== undefined) await this.runPreflightSlot(target).catch(() => undefined)
+    }
+    if (slot === undefined) return this.quota.read(force)
+    if (!slot.layout.system && process.platform === 'darwin') await unlockAccountKeychain(slot.layout, this.host.runCommand)
+    const snapshot = await this.quota.readFor(id, slot.env, force, slot.layout)
+    if (snapshot.status === 'ok') this.applyQuotaToSlot(slot, snapshot)
+    return snapshot
   }
 
-  /** Stop every session, the process, and the bridge. */
+  /**
+   * Plan quota of the account that serves one model right now.
+   *
+   * A surface that reads "the account that served the last step" hands a model
+   * another account's numbers: a Pro account that just ran a Flash turn lends
+   * its untouched Gemini window to Argon, which that plan cannot spend at all.
+   * Resolving the account with the scheduler's own rule keeps the number and
+   * the model on one subscription, and the echoed `model` lets a caller drop an
+   * answer that arrived after the user switched models.
+   * @param model - model asked about.
+   * @param force - bypass the cache.
+   * @param sessionId - DSH session whose bound account should be preferred, so
+   * the number belongs to the account this conversation actually spends.
+   * @returns the snapshot plus the resolved account and the governing windows.
+   */
+  async quotaForModel(model: string, force = false, sessionId?: string): Promise<QuotaSnapshot> {
+    const layout = this.accountForModel(model, sessionId)
+    if (layout === undefined) {
+      const snapshot = await this.quota.read(force)
+      return { ...snapshot, model, focus: resolveModelQuota(snapshot, model) }
+    }
+    const snapshot = this.withSlotEntitlements(layout.id, await this.quotaFor(layout.id, force))
+    return {
+      ...snapshot,
+      accountId: layout.id,
+      accountLabel: this.accountLabel(layout),
+      model,
+      focus: resolveModelQuota(snapshot, model),
+    }
+  }
+
+  /**
+   * Fold the entitlements the ACP front already reported into a CLI-read
+   * snapshot, which carries windows only. Without this a Pro account whose
+   * Argon is disabled upstream would look merely unlisted instead of denied.
+   * @param accountId - account the snapshot belongs to.
+   * @param snapshot - windows read through the account's credential store.
+   * @returns the snapshot with the account's known entitlements filled in.
+   */
+  private withSlotEntitlements(accountId: string, snapshot: QuotaSnapshot): QuotaSnapshot {
+    const slot = this.slots.get(accountId)
+    if (slot === undefined) return snapshot
+    const merged: QuotaSnapshot = { ...snapshot }
+    if ((merged.availableModels === undefined || merged.availableModels.length === 0)
+      && slot.availableModels !== undefined && slot.availableModels.length > 0) {
+      merged.availableModels = slot.availableModels
+    }
+    if (merged.disabledModels === undefined && slot.disabledModels !== undefined) merged.disabledModels = [...slot.disabledModels]
+    if (merged.subscriptionTier === undefined && slot.subscriptionTier !== undefined) merged.subscriptionTier = slot.subscriptionTier
+    if (merged.subscriptionName === undefined && slot.subscriptionName !== undefined) merged.subscriptionName = slot.subscriptionName
+    if (merged.argonSharedWithGemini === undefined && slot.subscriptionTier === 'ULTRA') merged.argonSharedWithGemini = true
+    return merged
+  }
+
+  /**
+   * Account the scheduler would spend one model on, without reserving anything.
+   * Preference order: an account that does not deny the model, then the
+   * scheduler's own pick, then the best owner of the family when every
+   * candidate is parked (its exhausted window is exactly what a person wants to
+   * see), then any enabled account of the family.
+   * @param model - model asked about.
+   * @param sessionId - DSH session that owns the conversation being described.
+   * @returns the account layout, or undefined when no account serves the model.
+   */
+  private accountForModel(model: string, sessionId?: string): AccountLayout | undefined {
+    const family = familyForModel(model)
+    const now = Date.now()
+    // The session that already ran keeps its account, so the number belongs to
+    // the subscription this conversation actually spends; a fresh conversation
+    // follows the pool's own pick.
+    const sticky = this.sessionAccount(sessionId) ?? this.lastAccount
+    // Attribution first: an account whose own announced catalog omits the model
+    // cannot spend it, even before any other account has announced it — the
+    // state right after a restart, or before the first warm-up. Scheduling stays
+    // as tolerant as before; only what the pill reports is resolved here.
+    const undenying = this.pool.choose(family, sticky, now,
+      layout => !this.accountDeniesModel(layout.id, model) && this.slotCanServeModel(layout.id, model, now))
+    if (undenying !== undefined) return undenying
+    const ready = this.pool.choose(family, sticky, now, layout => this.slotCanServeModel(layout.id, model, now))
+    if (ready !== undefined) return ready
+    const parked = this.pool.choose(family, sticky, now)
+    if (parked !== undefined) return parked
+    return this.pool.list().find(layout => layout.enabled && this.servesModel(layout.id, model))
+  }
+
+  /**
+   * Account bound to the main conversation of one DSH session, when it has
+   * already run a step.
+   * @param sessionId - DSH session id.
+   * @returns the account key, or undefined before the first step.
+   */
+  private sessionAccount(sessionId: string | undefined): string | undefined {
+    if (sessionId === undefined || sessionId.length === 0) return undefined
+    for (const conv of this.conversations.values()) {
+      if (conv.dshSessionId === sessionId && conv.purpose === MAIN_PURPOSE && conv.accountId !== undefined) return conv.accountId
+    }
+    return undefined
+  }
+
+  /**
+   * Whether one account's own report rules out a model: it is in the announced
+   * catalogue without the model, or upstream marked it disabled.
+   * @param accountId - account key.
+   * @param model - model asked about.
+   * @returns true when the account positively cannot serve the model.
+   */
+  private accountDeniesModel(accountId: string, model: string): boolean {
+    const slot = this.slots.get(accountId)
+    if (slot === undefined) return false
+    return slotDeniesModel(slot, model)
+  }
+
+  /**
+   * Human-readable attribution of one account: remark, then address, then key.
+   * @param layout - account layout.
+   * @returns the label a surface can show beside a quota number.
+   */
+  private accountLabel(layout: AccountLayout): string {
+    const remark = layout.label.trim()
+    if (remark.length > 0) return remark
+    const email = this.slots.get(layout.id)?.email
+    if (email !== undefined && email.length > 0) return email
+    return layout.id
+  }
+
+  /**
+   * Every configured account with its live process state, cooldowns, and sign-in.
+   * @returns one row per account in configured order.
+   */
+  accounts(): AccountStatus[] {
+    const sessions = new Map<string, number>()
+    for (const conv of this.conversations.values()) {
+      if (conv.sessionId === undefined || conv.accountId === undefined) continue
+      sessions.set(conv.accountId, (sessions.get(conv.accountId) ?? 0) + 1)
+    }
+    return this.pool.list().map((layout) => {
+      const slot = this.slots.get(layout.id)
+      const ownAllow = accountVisibleModels(layout.visibleModels)
+      const slotCatalog = slot?.availableModels ?? this.catalog.availableModels().map(m => ({ id: m.id, name: m.name }))
+      const accountAvailable = slotCatalog.map(m => ({
+        id: m.id,
+        name: m.name,
+        enabled: isListedModel(m.id, ownAllow),
+      }))
+      return {
+        id: layout.id,
+        label: layout.label,
+        system: layout.system,
+        enabled: layout.enabled,
+        root: layout.root,
+        home: layout.declaredHome,
+        env: { ...layout.env },
+        homeDir: layout.homeDir,
+        geminiDir: layout.geminiDir,
+        state: slot?.state ?? 'idle',
+        error: slot?.error ?? undefined,
+        cooldowns: this.pool.cooldowns(layout.id),
+        sessions: sessions.get(layout.id) ?? 0,
+        email: slot?.email ?? undefined,
+        ...(slot?.subscriptionTier !== undefined ? { subscriptionTier: slot.subscriptionTier } : {}),
+        ...(slot?.subscriptionName !== undefined ? { subscriptionName: slot.subscriptionName } : {}),
+        availableModels: accountAvailable,
+        ...(slot?.disabledModels !== undefined && slot.disabledModels.length > 0 ? { disabledModels: [...slot.disabledModels] } : {}),
+        contextWindow: layout.contextWindow,
+        visibleModels: [...layout.visibleModels],
+        priority: layout.priority,
+        weight: layout.weight,
+        proxyUrl: proxyUrlFromEnv(layout.env),
+        usage: {
+          inputTokens: slot?.usage.inputTokens ?? 0,
+          outputTokens: slot?.usage.outputTokens ?? 0,
+          totalTokens: slot?.usage.totalTokens ?? 0,
+        },
+      }
+    })
+  }
+
+  /**
+   * Run preflight and start one account's ACP front.
+   * @param accountId - account to start; defaults to the first enabled one.
+   * @returns the running process.
+   */
+  async ensureReady(accountId?: string): Promise<AcpProcess> {
+    if (this.disposed) throw new LlmError(labeled('TRANSPORT', 'Antigravity provider was disposed'), 'TRANSPORT')
+    const slot = accountId !== undefined ? this.slotFor(accountId) : this.defaultSlot()
+    return this.ensureSlotReady(slot)
+  }
+
+  private slotFor(accountId: string): AccountSlot {
+    const slot = this.slots.get(accountId)
+    if (slot === undefined) throw new LlmError(labeled('UNKNOWN_MODEL', `Unknown Antigravity account "${accountId}"`), 'UNKNOWN_MODEL')
+    return slot
+  }
+
+  private defaultSlot(): AccountSlot {
+    for (const slot of this.slots.values()) if (slot.layout.enabled) return slot
+    throw new LlmError(labeled('AUTH', 'No enabled Antigravity account is configured'), 'AUTH')
+  }
+
+  private async ensureSlotReady(slot: AccountSlot): Promise<AcpProcess> {
+    if (this.disposed) throw new LlmError(labeled('TRANSPORT', 'Antigravity provider was disposed'), 'TRANSPORT')
+    if (slot.process?.alive === true) return slot.process
+    slot.starting ??= this.startSlot(slot).finally(() => { slot.starting = undefined })
+    return slot.starting
+  }
+
+  /**
+   * Warm one or all accounts and refresh their per-account catalogs.
+   * @param accountId - optional single account to refresh.
+   * @returns resolves when discovery finished.
+   */
+  async warmup(accountId?: string): Promise<void> {
+    // Nothing to discover while the account list is empty; the provider stays
+    // idle until the settings page adds an account.
+    if (this.pool.list().length === 0) return
+    if (accountId !== undefined) {
+      const target = this.slotFor(accountId)
+      target.email = await readAccountEmail(target.layout, this.host.runCommand).catch(() => undefined)
+      if (target.email !== undefined && target.email.length > 0) {
+        const snap = await this.quotaFor(target.layout.id, true)
+        if (snap.status === 'ok' && snap.availableModels !== undefined && snap.availableModels.length > 0) {
+          this.lastError = undefined
+          return
+        }
+      }
+      await this.warmupSlotViaAcp(target)
+      return
+    }
+
+    await this.refreshAccountEmails()
+    const signedIn = [...this.slots.values()].filter(c => c.layout.enabled && typeof c.email === 'string' && c.email.length > 0)
+    if (signedIn.length > 0) {
+      const snapshots = await Promise.all(signedIn.map(s => this.quotaFor(s.layout.id, true).catch(() => undefined)))
+      if (snapshots.some(s => s !== undefined && s.status === 'ok' && s.availableModels !== undefined && s.availableModels.length > 0)) {
+        this.lastError = undefined
+        return
+      }
+    }
+    const slot = signedIn[0] ?? this.defaultSlot()
+    await this.warmupSlotViaAcp(slot)
+  }
+
+  private async warmupSlotViaAcp(slot: AccountSlot): Promise<void> {
+    try {
+      const proc = await this.ensureSlotReady(slot)
+      const result = await proc.newSession({
+        cwd: slot.preflight?.workspace ?? slot.layout.workspace,
+        mcpServers: [],
+      }, { onUpdate: () => undefined }, 120_000)
+      this.observeSlotCatalog(slot, result.configOptions, result.models?.availableModels)
+      this.lastError = undefined
+      await proc.closeSession(result.sessionId)
+    } catch (error) {
+      this.lastError = error instanceof Error ? error.message : String(error)
+      throw error
+    }
+  }
+
+  /** Stop every session, every account process, the bridge, and pending sign-ins. */
   async dispose(): Promise<void> {
     this.disposed = true
     if (this.sweeper !== undefined) clearInterval(this.sweeper)
-    for (const conv of this.conversations.values()) conv.turn?.abandon('The harness provider was unloaded.')
+    for (const session of this.logins.values()) session.child.terminate()
+    this.logins.clear()
+    for (const conv of this.conversations.values()) {
+      if (conv.turn === undefined) this.persistConversation(conv)
+      else conv.turn.abandon('The harness provider was unloaded.')
+    }
     this.conversations.clear()
     this.tenants.clear()
-    this.process?.stop()
-    this.process = undefined
+    for (const slot of this.slots.values()) {
+      slot.process?.stop()
+      slot.process = undefined
+      slot.state = 'idle'
+    }
     await this.bridge.close()
   }
 
+  private noteUsage(slot: AccountSlot, usage: { inputTokens?: number; outputTokens?: number; totalTokens?: number } | undefined): void {
+    if (usage === undefined) return
+    const input = Math.max(0, Math.round(usage.inputTokens ?? 0))
+    const output = Math.max(0, Math.round(usage.outputTokens ?? 0))
+    slot.usage.inputTokens += input
+    slot.usage.outputTokens += output
+    slot.usage.totalTokens += Math.max(0, Math.round(usage.totalTokens ?? input + output))
+  }
+
+  private slotCanServeModel(accountId: string, model: string, now = Date.now()): boolean {
+    if (!this.servesModel(accountId, model)) return false
+    if (/argon/i.test(model) && this.pool.cooldownMs(accountId, 'argon', now) > 0) return false
+    const slot = this.slots.get(accountId)
+    if (slot === undefined) return true
+    if (slotDisablesModel(slot, model)) {
+      return false
+    }
+    if (slot.availableModels !== undefined && slot.availableModels.length > 0) {
+      const anySlotListsModel = [...this.slots.values()].some(
+        s => s.availableModels?.some(m => m.id === model) === true,
+      )
+      if (anySlotListsModel && !slot.availableModels.some(m => m.id === model)) {
+        return false
+      }
+    }
+    const cachedQuota = this.quota.peekFor(accountId)
+    if (cachedQuota?.status === 'ok' && cachedQuota.groups.length > 0) {
+      const group = groupForModel(cachedQuota.groups, model)
+      const weekly = group?.buckets.find(b => isWeeklyBucket(b) && !b.disabled)
+      if (weekly !== undefined && weekly.remainingFraction <= 0.005) {
+        const resetMs = Date.parse(weekly.resetTime)
+        if (!Number.isFinite(resetMs) || resetMs > now) return false
+      }
+    }
+    return true
+  }
+
   /**
-   * Stream one DSH model step.
+   * Stream one model step, failing over to another enabled account when the
+   * chosen account hits a quota window or lacks model entitlement before any output is emitted.
    * @param options - the model request.
    * @yields stream chunks.
    */
@@ -292,72 +896,97 @@ export class AntigravityRuntime {
       yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'Request aborted', code: 'ABORTED' } } }
       return
     }
-    const proc = await this.ensureReady()
-    // Purposes are declared by producer packages this plugin does not import.
+    // An empty account list is a configuration the user can repair in one step
+    // from the settings page, so it reports as a sign-in failure instead of
+    // surfacing as a quota exhaustion with no account rows.
+    if (!this.pool.list().some(layout => layout.enabled)) {
+      throw new LlmError(labeled('AUTH', NO_ACCOUNT_MESSAGE), 'AUTH')
+    }
     const declaredPurpose = (options as { purpose?: string }).purpose
     const purpose = declaredPurpose !== undefined && declaredPurpose.length > 0 ? declaredPurpose : MAIN_PURPOSE
     const scope = options.sessionId ?? `anon-${randomBytes(6).toString('hex')}`
     const key = `${scope}|${purpose}`
     const release = await this.mutex.acquire(key)
+    const family = familyForModel(options.model)
+    const cooldownKey: CooldownKey = /argon/i.test(options.model) ? 'argon' : family
+    const attempted = new Set<string>()
     let conv: Conversation | undefined
+    let emitted = false
     try {
-      conv = await this.acquireConversation(key, purpose)
+      conv = await this.acquireConversation(key, purpose, options.sessionId)
       conv.lastUsed = Date.now()
-      const split = splitSystem(options)
-      const tools = toBridgeTools(options.tools)
-      conv.toolNames = new Set(tools.map(t => t.name))
-      const effort = this.effectiveEffort(options.model, asEffort(options.reasoningEffort) ?? this.defaultEffort())
-
-      if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
-        // Resuming a parked turn is only valid while the request still starts
-        // with the exact history this ACP session already owns. A compaction
-        // checkpoint or a pruned/rewritten prefix means the live server-side
-        // context is stale: resolving the parked calls would grow it further
-        // instead of adopting the compacted history, so abandon the turn and
-        // let plan() rebuild the session from DSH's authoritative messages.
-        if (!this.historyPrefixIntact(conv, split.system, split.messages)) {
-          this.dropTurn(conv, 'The conversation history was compacted or rewritten; rebuilding the session from the harness history.')
-        } else {
-          const resumed = await this.deliverResults(conv, split.messages, proc, tools)
-          if (resumed) {
-            conv.knownIds = messageIds(split.messages)
-            yield * this.pump(conv, proc, options, effort)
-            return
+      for (;;) {
+        const now = Date.now()
+        const liveByAccount = new Map<string, number>()
+        for (const c of this.conversations.values()) {
+          if (c.sessionId !== undefined && c.accountId !== undefined) {
+            liveByAccount.set(c.accountId, (liveByAccount.get(c.accountId) ?? 0) + 1)
           }
-          this.dropTurn(conv, 'The conversation history changed; the harness restarted this turn.')
         }
-      } else if (conv.turn !== undefined) {
-        this.dropTurn(conv, 'Superseded by a newer request.')
+        const layout = this.pool.choose(
+          family,
+          conv.accountId,
+          now,
+          candidate => !attempted.has(candidate.id) && this.slotCanServeModel(candidate.id, options.model, now),
+          id => liveByAccount.get(id) ?? 0,
+        )
+        if (layout === undefined) throw this.poolExhausted(family, attempted, options.model, cooldownKey)
+        const slot = this.slotFor(layout.id)
+        try {
+          for await (const chunk of this.attempt(conv, slot, options)) {
+            emitted = true
+            yield chunk
+          }
+          return
+        } catch (error) {
+          if (emitted || attempted.has(layout.id)) throw error
+          if (isUnknownModelFailure(error)) {
+            slot.disabledModels = [...new Set([...(slot.disabledModels ?? []), options.model])]
+            await this.failover(conv, slot, options.model, attempted, {
+              reject: () => error,
+              log: `antigravity-acp: account "${layout.id}" is not entitled to ${options.model}; failing over to another account`,
+              reason: 'The account serving this conversation does not offer the requested model.',
+            })
+            continue
+          }
+          // Degraded-route failures ask the harness retry layer for the identical
+          // request instead of upstream quota: they must never cool an account
+          // down, park one, or fail the step over to another account.
+          if (isReanswerFailure(error)) throw error
+          const code = failureCode(error)
+          if (code === 'RATE_LIMIT') {
+            // Upstream overload, not an exhausted window: cool the account for
+            // the stated delay and fail over when someone else can serve the
+            // model; with no other account, rethrow so the harness retry layer
+            // asks upstream again instead of burning a whole family window.
+            const message = error instanceof Error ? error.message : String(error)
+            const retryAfterMs = retryAfterMsFromError(error)
+            await this.failover(conv, slot, options.model, attempted, {
+              reject: () => new LlmError(message, 'RATE_LIMIT', {
+                cause: error,
+                ...retryAfterMs === undefined ? {} : { providerRetryAfterMs: retryAfterMs },
+              }),
+              cool: () => {
+                const transientKey: CooldownKey = cooldownKey === 'argon' && slot.subscriptionTier !== 'ULTRA' ? 'argon' : family
+                this.pool.exhaust(layout.id, transientKey, Date.now() + (retryAfterMs ?? TRANSIENT_COOLDOWN_MS), message)
+              },
+              log: `antigravity-acp: account "${layout.id}" is briefly rate limited on ${options.model} (${message}); cooling down and moving to the next account`,
+              reason: 'The account serving this conversation is briefly rate limited.',
+            })
+            continue
+          }
+          if (!isQuotaFailure(error)) throw error
+          const message = error instanceof Error ? error.message : String(error)
+          await this.failover(conv, slot, options.model, attempted, {
+            cool: () => {
+              const parkKey: CooldownKey = cooldownKey === 'argon' && slot.subscriptionTier !== 'ULTRA' ? 'argon' : family
+              this.pool.exhaustFor(layout.id, parkKey, resetTimeFromError(error), message)
+            },
+            log: `antigravity-acp: account "${layout.id}" cannot serve ${options.model} (${message}); moving to the next account`,
+            reason: 'The account serving this conversation ran out of quota.',
+          })
+        }
       }
-
-      const plan = this.plan(conv, split.system, split.messages)
-      if (plan.rebuild) await this.resetSession(conv)
-      if (conv.sessionId === undefined) {
-        conv.systemHash = digest(split.system)
-        await this.openSession(conv, split.system, tools, proc)
-      }
-      await this.select(conv, proc, options.model, effort)
-      const replayBudget = this.preflight?.unlock.status === 'unlocked'
-        ? UNLOCKED_REPLAY_BUDGET_BYTES
-        : LOCKED_REPLAY_BUDGET_BYTES
-      let blocks: AcpPromptBlock[]
-      if (plan.rebuild) {
-        blocks = await replayPrompt(plan.history, plan.input, this.host.readImage, replayBudget)
-      } else {
-        blocks = await inputPrompt(plan.input, this.host.readImage)
-        const toolDelta = consumeToolDelta(conv, tools)
-        if (toolDelta.length > 0) blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
-      }
-      conv.knownIds = messageIds(split.messages)
-      // A new turn starts with an empty reported-identity space: ids from past
-      // turns must never back a fresh permission request.
-      conv.reportedToolCalls.clear()
-      conv.turn = new AcpTurn(this.nextTurnTag(split.messages))
-      if (conv.sessionId !== undefined) {
-        conv.usageCursor = peekMaxModelStepIdx(sessionDbPath(this.home, conv.sessionId))
-      }
-      this.startPrompt(conv, proc, blocks)
-      yield * this.pump(conv, proc, options, effort)
     } finally {
       release()
       if (conv !== undefined) {
@@ -368,13 +997,299 @@ export class AntigravityRuntime {
   }
 
   /**
-   * Acquire one conversation under the capacity gate. When every slot is busy,
-   * the oldest idle (non-opening) session is evicted first; if the cap is still
-   * reached, the request is rejected immediately instead of queueing, because a
-   * waiting subagent and its parent share the same provider route and would
-   * deadlock.
+   * Move one failed step to the next account: record the failure on the account
+   * that served it, then reset the conversation so the retry opens a fresh ACP
+   * session elsewhere.
+   * @param conv - the conversation being served.
+   * @param slot - the account whose attempt failed.
+   * @param model - requested model id.
+   * @param attempted - accounts already tried in this step.
+   * @param outcome.reject - builds the error rethrown when no other account can serve the step; omitted when the account is parked unconditionally.
+   * @param outcome.cool - records this account's own cooldown; omitted when the failure already marked the account (a model denial).
+   * @param outcome.log - warning line for the server log.
+   * @param outcome.reason - why the abandoned turn was dropped.
    */
-  private async acquireConversation(key: string, purpose: string): Promise<Conversation> {
+  private async failover(
+    conv: Conversation,
+    slot: AccountSlot,
+    model: string,
+    attempted: Set<string>,
+    outcome: { reject?: () => unknown; cool?: () => void; log: string; reason: string },
+  ): Promise<void> {
+    if (outcome.reject !== undefined && !this.hasAnotherAccount(slot.layout.id, attempted, model)) throw outcome.reject()
+    attempted.add(slot.layout.id)
+    outcome.cool?.()
+    this.host.log.warn(outcome.log)
+    this.dropTurn(conv, outcome.reason)
+    await this.resetSession(conv)
+    conv.accountId = undefined
+  }
+
+  /**
+   * Whether an account other than the failed one could still serve this step.
+   * @param accountId - account whose attempt failed.
+   * @param attempted - accounts already tried in this step.
+   * @param model - requested model id.
+   * @returns true when one enabled, untried account can serve the model now.
+   */
+  private hasAnotherAccount(accountId: string, attempted: ReadonlySet<string>, model: string): boolean {
+    const now = Date.now()
+    return this.pool.list().some(
+      c => c.enabled && c.id !== accountId && !attempted.has(c.id) && this.slotCanServeModel(c.id, model, now),
+    )
+  }
+
+  /** One attempt of a step on one account; throws when that account cannot serve it. */
+  private async * attempt(conv: Conversation, slot: AccountSlot, options: GenerateOptions): AsyncGenerator<StreamChunk> {
+    const proc = await this.ensureSlotReady(slot)
+    if (conv.accountId !== slot.layout.id) {
+      this.dropTurn(conv, 'Rebuilding on another account.')
+      await this.resetSession(conv)
+      conv.accountId = slot.layout.id
+    }
+    const split = splitSystem(options)
+    const activeSchemas = resolveActiveToolSchemas(options.tools, split.messages)
+    const tools = toBridgeTools(activeSchemas)
+    conv.toolNames = new Set(tools.map(t => t.name))
+    const effort = this.effectiveEffort(options.model, asEffort(options.reasoningEffort) ?? this.defaultEffort())
+    const key = reanswerKey(options, split.system)
+    if (conv.reanswer.key !== key) {
+      // A different request: a pending re-answer is stale, this one starts fresh.
+      conv.reanswer.key = key
+      conv.reanswer.granted = 0
+      conv.reanswer.blocks = []
+      conv.reanswer.awaiting = false
+      conv.reanswer.freshSession = false
+    }
+    if (conv.reanswer.awaiting) {
+      yield * this.reanswer(conv, slot, proc, options, effort, split.system, activeSchemas, tools)
+      return
+    }
+
+    if (conv.turn !== undefined && conv.turn.pendingCalls.size > 0) {
+      if (!historyPrefixIntact(conv, split.system, split.messages)) {
+        this.dropTurn(conv, 'The conversation history was compacted or rewritten; rebuilding the session from the harness history.')
+      } else {
+        const resumed = await this.deliverResults(conv, slot, split.messages, proc, tools)
+        if (resumed) {
+          yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(split.messages) })
+          return
+        }
+        this.dropTurn(conv, 'The conversation history changed; the harness restarted this turn.')
+      }
+    } else if (conv.turn !== undefined) {
+      this.dropTurn(conv, 'Superseded by a newer request.')
+    }
+
+    let resumedFromDisk = false
+    if (conv.sessionId === undefined && !conv.dirty && conv.purpose === MAIN_PURPOSE && conv.dshSessionId !== undefined) {
+      resumedFromDisk = await this.tryResumePersistedSession(conv, slot, split.system, split.messages, activeSchemas, proc)
+    }
+
+    const plan = planPrompt(conv, split.system, split.messages, this.host.config.provider)
+    if (plan.rebuild) await this.resetSession(conv)
+    const freshSession = conv.sessionId === undefined
+    if (freshSession) {
+      conv.systemHash = digest(split.system)
+      await this.openSession(conv, slot, split.system, activeSchemas, tools, proc)
+    }
+    const switched = await this.select(conv, proc, options.model, effort)
+    const settleMs = this.host.config.coldSwitchSettleMs ?? 80
+    if ((freshSession || resumedFromDisk) && switched && settleMs > 0) {
+      await new Promise<void>(resolve => setTimeout(resolve, settleMs))
+    }
+    const replayBudget = slot.preflight?.unlock.status === 'unlocked'
+      ? UNLOCKED_REPLAY_BUDGET_BYTES
+      : LOCKED_REPLAY_BUDGET_BYTES
+    let blocks: AcpPromptBlock[]
+    if (plan.rebuild) {
+      blocks = await replayPrompt(plan.history, plan.input, this.host.readImage, replayBudget)
+    } else {
+      blocks = await inputPrompt(plan.input, this.host.readImage, { omitPureToolUpdates: true })
+      const toolDelta = consumeToolDelta(conv, tools)
+      if (toolDelta.length > 0) blocks.unshift({ type: 'text', text: `${toolDelta}\n\n` })
+    }
+    const nextKnownIds = messageIds(split.messages)
+    conv.reportedToolCalls.clear()
+    conv.turn = new AcpTurn(this.nextTurnTag(split.messages))
+    conv.health.beginTurn()
+    // Record the request this prompt belongs to; a rebuild above (which
+    // replaced the whole bookkeeping object) already cleared it.
+    conv.reanswer.key = key
+    conv.reanswer.blocks = blocks
+    conv.reanswer.awaiting = false
+    conv.reanswer.freshSession = false
+    if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
+    this.lastAccount = slot.layout.id
+    this.pool.touch(slot.layout.id)
+    this.startPrompt(conv, proc, blocks)
+    yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds })
+  }
+
+  /**
+   * Re-send one request that DSH retried after a degraded attempt: continue the
+   * warm ACP session with the reroll notice, or — when the degraded attempt
+   * never completed a round in a cold session — replace it and re-send the
+   * original prompt.
+   * @param conv - the conversation whose bookkeeping holds the pending record.
+   * @param slot - account serving this conversation.
+   * @param proc - its ACP front.
+   * @param options - the repeated request.
+   * @param effort - resolved reasoning effort.
+   * @param system - request system text.
+   * @param activeSchemas - tools active for this step.
+   * @param tools - their bridge descriptors.
+   * @yields stream chunks of the re-answer.
+   */
+  private async * reanswer(
+    conv: Conversation,
+    slot: AccountSlot,
+    proc: AcpProcess,
+    options: GenerateOptions,
+    effort: Effort,
+    system: string,
+    activeSchemas: readonly ToolSchema[],
+    tools: readonly BridgeTool[],
+  ): AsyncGenerator<StreamChunk> {
+    const state = conv.reanswer
+    const fresh = state.freshSession || conv.sessionId === undefined
+    const original = state.blocks
+    state.awaiting = false
+    state.freshSession = false
+    conv.reportedToolCalls.clear()
+    conv.health.beginTurn()
+    conv.turn = new AcpTurn(this.nextTurnTag(options.messages))
+    let blocks: AcpPromptBlock[]
+    if (fresh) {
+      // Only a session that never finished a round is replaced: its poisoned
+      // first turn cannot be continued, so the original input is re-sent.
+      await this.resetSession(conv)
+      conv.reanswer.key = state.key
+      conv.reanswer.granted = state.granted
+      conv.reanswer.blocks = original
+      conv.systemHash = digest(system)
+      // Tag the replayed system text so the fresh session's first 2048-token block hashes
+      // differently upstream: the fallback pool's prefix cache no longer matches this request.
+      await this.openSession(conv, slot, `[reanswer:${conv.tag}:${state.granted}]\n\n${system}`, activeSchemas, tools, proc)
+      const freshDb = sessionDbPath(slot.layout.geminiDir, conv.sessionId as string)
+      this.pinUsageCursors(conv, freshDb)
+      await this.select(conv, proc, options.model, effort)
+      blocks = original.length > 0 ? original : [{ type: 'text', text: REROLL_CONTINUATION_PROMPT }]
+    } else {
+      conv.promptGen++
+      await Promise.race([conv.promptSettled, delay(3_000)])
+      blocks = [{ type: 'text', text: REROLL_CONTINUATION_PROMPT }]
+    }
+    this.lastAccount = slot.layout.id
+    this.pool.touch(slot.layout.id)
+    this.startPrompt(conv, proc, blocks)
+    yield * this.pump(conv, slot, proc, options, effort, { nextKnownIds: messageIds(options.messages) })
+  }
+
+  private async tryResumePersistedSession(
+    conv: Conversation,
+    slot: AccountSlot,
+    system: string,
+    messages: readonly RequestMessage[],
+    activeSchemas: readonly ToolSchema[],
+    proc: AcpProcess,
+  ): Promise<boolean> {
+    const dshId = conv.dshSessionId
+    if (dshId === undefined) return false
+    const persisted = this.sessions.get(dshId)
+    if (persisted === undefined || persisted.accountId !== slot.layout.id) return false
+    if (persisted.systemHash !== digest(system)) {
+      this.sessions.forget(dshId)
+      return false
+    }
+    if (
+      persisted.knownIds.length > messages.length
+      || !persisted.knownIds.every((id, idx) => messages[idx]?.id === id)
+    ) {
+      this.sessions.forget(dshId)
+      return false
+    }
+    const issued = new Set(persisted.issuedIds)
+    const rest = pendingInput(
+      messages.slice(persisted.knownIds.length),
+      message => isOwnMessage(message, this.host.config.provider, issued),
+    )
+    if (rest.length === 0) {
+      this.sessions.forget(dshId)
+      return false
+    }
+
+    const caps = proc.initializeResult?.agentCapabilities as { loadSession?: unknown; sessionCapabilities?: { load?: unknown } } | undefined
+    const dbExists = existsSync(sessionDbPath(slot.layout.geminiDir, persisted.acpSessionId))
+    if (!dbExists && caps?.loadSession !== true && caps?.sessionCapabilities?.load === undefined) {
+      return false
+    }
+
+    conv.reportedToolCalls.clear()
+    conv.advertisedTools = persisted.advertisedTools.map(t => ({ ...t }))
+    conv.advertisedToolNames = new Set(persisted.advertisedTools.map(t => t.name))
+    conv.knownTools = new Map(persisted.knownTools)
+    const mount = mountBridge(conv, {
+      bridgeUrl: this.bridge.url,
+      system,
+      toolContracts: renderFullToolContracts(activeSchemas, MAX_EAGER_BRIDGE_TOOL_BYTES),
+      registerTenant: (tenantKey, tenant) => this.tenants.set(tenantKey, tenant),
+      observeConfigOptions: options => this.observeSlotCatalog(slot, options, undefined),
+      permission: request => this.answerPermission(conv, request),
+      warn: message => this.host.log.warn(message),
+    })
+    try {
+      const result = await proc.loadSession({
+        sessionId: persisted.acpSessionId,
+        cwd: slot.layout.workspace,
+        mcpServers: mount.mcpServers,
+        _meta: { antigravity: { systemPrompt: { append: mount.systemAppend } } },
+      }, mount.listener, 60_000)
+      conv.sessionId = result.sessionId || persisted.acpSessionId
+      conv.process = proc
+      conv.configOptions = result.configOptions ?? []
+      conv.systemHash = persisted.systemHash
+      conv.knownIds = [...persisted.knownIds]
+      conv.issuedIds = new Set(persisted.issuedIds)
+      conv.model = undefined
+      conv.effort = undefined
+      conv.dirty = false
+      this.observeSlotCatalog(slot, result.configOptions, result.models?.availableModels)
+      return true
+    } catch (error) {
+      detachBridge(conv, tenant => this.releaseTenant(tenant))
+      this.sessions.forget(dshId)
+      this.host.log.info(`antigravity-acp: session/load unavailable for ${persisted.acpSessionId} (${error instanceof Error ? error.message : String(error)}); falling back to session/new`)
+      return false
+    }
+  }
+
+  /** Explain why no account could serve a step, one line per account. */
+  private poolExhausted(family: Family, attempted: ReadonlySet<string>, model: string, cooldownKey: CooldownKey): LlmError {
+    const now = Date.now()
+    let retryAfterMs: number | undefined
+    const rows = this.pool.list().map((layout) => {
+      const failed = attempted.has(layout.id) ? ' (failed this step)' : ''
+      if (!layout.enabled) return `${layout.id} disabled${failed}`
+      if (!this.servesModel(layout.id, model) || this.accountDeniesModel(layout.id, model)) {
+        return `${layout.id} not entitled to ${model}${failed}`
+      }
+      const familyRemaining = this.pool.cooldownMs(layout.id, family, now)
+      const argonRemaining = cooldownKey === 'argon' || /argon/i.test(model) ? this.pool.cooldownMs(layout.id, 'argon', now) : 0
+      const remaining = Math.max(familyRemaining, argonRemaining)
+      if (remaining <= 0) return `${layout.id} unavailable${failed}`
+      const parkedBucket: CooldownKey = argonRemaining > familyRemaining ? 'argon' : family
+      const reason = this.pool.cooldownReason(layout.id, parkedBucket, now)
+      const detail = reason === undefined || reason.length === 0 ? '' : ` (last error: ${reason.slice(0, 160)})`
+      const parked = `${layout.id} parked ${Math.ceil(remaining / 60_000)}m${detail}${failed}`
+      retryAfterMs = retryAfterMs === undefined ? remaining : Math.min(retryAfterMs, remaining)
+      return parked
+    })
+    const message = `No Antigravity account can serve ${model} right now: ${rows.length > 0 ? rows.join('; ') : 'none configured'}`
+    return new LlmError(labeled('RATE_LIMIT', message), 'RATE_LIMIT', retryAfterMs === undefined ? undefined : { providerRetryAfterMs: retryAfterMs })
+  }
+
+  private async acquireConversation(key: string, purpose: string, dshSessionId?: string): Promise<Conversation> {
     const existing = this.conversations.get(key)
     if (existing !== undefined) {
       existing.opening = true
@@ -394,14 +1309,15 @@ export class AntigravityRuntime {
           .sort((a, b) => a.lastUsed - b.lastUsed)
         while (this.conversations.size >= max && idle.length > 0) {
           const victim = idle.shift() as Conversation
+          this.persistConversation(victim)
           this.conversations.delete(victim.key)
-          await this.resetSession(victim)
+          await this.resetSession(victim, true)
         }
       }
       if (this.conversations.size >= max) {
-        throw new LlmError(`CAPACITY_EXCEEDED: maxLiveSessions (${max}) reached`, 'RATE_LIMIT')
+        throw new LlmError(labeled('RATE_LIMIT', `CAPACITY_EXCEEDED: maxLiveSessions (${max}) reached`), 'RATE_LIMIT')
       }
-      const conv = this.createConversation(key, purpose)
+      const conv = this.createConversation(key, purpose, dshSessionId)
       conv.opening = true
       return conv
     } finally {
@@ -409,10 +1325,17 @@ export class AntigravityRuntime {
     }
   }
 
-  private createConversation(key: string, purpose: string): Conversation {
+  private createConversation(key: string, purpose: string, dshSessionId?: string): Conversation {
+    const cleanDshId = dshSessionId !== undefined && dshSessionId.length > 0 ? dshSessionId : undefined
+    const persistedAccount = purpose === MAIN_PURPOSE && cleanDshId !== undefined
+      ? this.sessions.get(cleanDshId)?.accountId
+      : undefined
     const conv: Conversation = {
       key,
+      dshSessionId: cleanDshId,
       purpose,
+      tag: randomBytes(3).toString('hex'),
+      accountId: persistedAccount !== undefined && this.slots.has(persistedAccount) ? persistedAccount : undefined,
       tenantKey: undefined,
       tenantSecret: undefined,
       sessionId: undefined,
@@ -425,7 +1348,14 @@ export class AntigravityRuntime {
       toolNames: new Set(),
       reportedToolCalls: new Map(),
       opening: false,
+      usageSource: undefined,
+      genMetaCursor: -1,
       usageCursor: -1,
+      backfilledSteps: 0,
+      health: new RouteHealth(purpose === MAIN_PURPOSE),
+      reanswer: freshReanswer(),
+      promptGen: 0,
+      promptSettled: Promise.resolve(),
       knownIds: undefined,
       issuedIds: new Set(),
       turn: undefined,
@@ -438,10 +1368,11 @@ export class AntigravityRuntime {
     return conv
   }
 
-  private async start(): Promise<AcpProcess> {
-    this.state = 'starting'
+  private async startSlot(slot: AccountSlot): Promise<AcpProcess> {
+    slot.state = 'starting'
+    slot.error = undefined
     try {
-      const preflight = await this.runPreflight()
+      const preflight = await this.runPreflightSlot(slot)
       await this.bridge.start()
       const argv = [
         preflight.binary, 'acp',
@@ -456,54 +1387,75 @@ export class AntigravityRuntime {
         argv,
         cwd: preflight.workspace,
         spawn: this.host.spawnAcp,
-        // The ACP server only advertises Claude and GPT-OSS to clients on its
-        // JetBrains/Zed/Xcode allowlist; this prefix is what unlocks them.
+        env: slot.env,
         clientName: 'jetbrains.dsh',
         clientVersion: '0.1.0',
         log: message => this.host.log.warn(message),
       })
       proc.onExit(error => this.onProcessExit(proc, error))
       await proc.start(120_000)
-      this.process = proc
-      this.state = 'ready'
+      slot.process = proc
+      slot.state = 'ready'
+      slot.readyAt = Date.now()
       this.lastError = undefined
       return proc
     } catch (error) {
-      this.state = 'error'
-      this.lastError = error instanceof Error ? error.message : String(error)
+      slot.state = 'error'
+      slot.error = error instanceof Error ? error.message : String(error)
+      this.lastError = slot.error
       throw mapError(error)
     }
   }
 
-  private runPreflight(): Promise<PreflightResult> {
-    if (this.preflight !== undefined) return Promise.resolve(this.preflight)
-    this.preflightPromise ??= (async () => {
+  private runPreflightSlot(slot: AccountSlot): Promise<PreflightResult> {
+    if (slot.preflight !== undefined) return Promise.resolve(slot.preflight)
+    slot.preflightPromise ??= (async () => {
       const config = this.host.config
       const binary = resolveAgyBinary(config.command)
+      this.binary = binary
       const version = await readVersion(binary, this.host.runCommand)
       assertSupportedAgyVersion(version, binary)
       const script = config.patchScript.length > 0 ? config.patchScript : defaultPatchScript()
       const unlock = await checkUnlock(binary, script, config.autoPatch, this.host.runCommand)
-      this.host.log.info(`antigravity-acp: ${unlock.detail}`)
-      const workspace = prepareHome(this.home)
-      const result: PreflightResult = { binary, version, home: this.home, workspace, logFile: join(this.home, 'acp.log'), unlock }
-      this.preflight = result
+      this.host.log.info(`antigravity-acp: [${slot.layout.id}] ${unlock.detail}`)
+      await ensureLayout(slot.layout, this.host.runCommand)
+      const email = await readAccountEmail(slot.layout, this.host.runCommand).catch(() => undefined)
+      slot.email = email
+      const result: PreflightResult = {
+        binary,
+        version,
+        home: slot.layout.geminiDir,
+        workspace: slot.layout.workspace,
+        logFile: slot.layout.logFile,
+        unlock,
+      }
+      slot.preflight = result
       this.host.onModelsChanged()
       return result
-    })().finally(() => { this.preflightPromise = undefined })
-    return this.preflightPromise
+    })().finally(() => { slot.preflightPromise = undefined })
+    return slot.preflightPromise
   }
 
   private onProcessExit(proc: AcpProcess, error: Error): void {
-    if (this.process === proc) this.process = undefined
-    if (!this.disposed) {
-      this.state = 'error'
-      this.lastError = error.message
-      this.host.log.warn(`antigravity-acp: ${error.message}`)
+    for (const slot of this.slots.values()) {
+      if (slot.process !== proc) continue
+      slot.process = undefined
+      if (!this.disposed) {
+        slot.state = 'error'
+        slot.error = error.message
+        this.lastError = error.message
+        this.host.log.warn(`antigravity-acp: [${slot.layout.id}] ${error.message}`)
+      }
     }
     for (const conv of this.conversations.values()) {
       if (conv.process !== proc) continue
-      conv.turn?.events.push({ kind: 'error', error: new LlmError(`Antigravity ACP process exited: ${error.message}`, 'TRANSPORT') })
+      const crashedMidTurn = conv.turn !== undefined && !conv.turn.finished
+      if (crashedMidTurn) {
+        this.sessions.forget(conv.dshSessionId)
+        conv.turn?.events.push({ kind: 'error', error: new LlmError(labeled('TRANSPORT', `Antigravity ACP process exited: ${error.message}`), 'TRANSPORT') })
+      } else {
+        this.persistConversation(conv)
+      }
       this.releaseTenant(conv)
       conv.sessionId = undefined
       conv.process = undefined
@@ -513,60 +1465,54 @@ export class AntigravityRuntime {
       conv.advertisedToolNames.clear()
       conv.knownTools.clear()
       conv.reportedToolCalls.clear()
-      conv.usageCursor = -1
-      conv.dirty = true
+      this.resetUsageReading(conv)
+      // Same process, same session history of refused answers: keep what the
+      // pill already reported about them.
+      conv.health = conv.health.reset({ keep: ['interceptedSteps', 'lastInterceptedState'] })
+      conv.reanswer = freshReanswer()
+      conv.dirty = crashedMidTurn
     }
   }
 
-  private async openSession(conv: Conversation, system: string, tools: readonly BridgeTool[], proc: AcpProcess): Promise<void> {
-    syncOAuthToken(this.home)
+  private async openSession(
+    conv: Conversation,
+    slot: AccountSlot,
+    system: string,
+    activeSchemas: readonly ToolSchema[],
+    tools: readonly BridgeTool[],
+    proc: AcpProcess,
+  ): Promise<void> {
+    syncOAuthToken(slot.layout.geminiDir, slot.layout.homeDir)
     conv.reportedToolCalls.clear()
     conv.advertisedTools = [...tools]
     conv.advertisedToolNames = new Set(tools.map(t => t.name))
     conv.knownTools = new Map(tools.map(t => [t.name, digest(t)]))
-    const attachMcp = conv.advertisedTools.length > 0 || conv.purpose === MAIN_PURPOSE
-    const tenantKey = attachMcp ? randomBytes(16).toString('hex') : undefined
-    const tenantSecret = tenantKey !== undefined ? randomBytes(24).toString('hex') : undefined
-    const mcpServers = tenantKey !== undefined && tenantSecret !== undefined
-      ? [{ type: 'http', name: MCP_SERVER_NAME, url: `${this.bridge.url}/${tenantKey}`, headers: [{ name: 'Authorization', value: `Bearer ${tenantSecret}` }] }]
-      : []
-    conv.tenantKey = tenantKey
-    conv.tenantSecret = tenantSecret
-    if (tenantKey !== undefined) this.tenants.set(tenantKey, conv)
+    const mount = mountBridge(conv, {
+      bridgeUrl: this.bridge.url,
+      system,
+      toolContracts: renderFullToolContracts(activeSchemas, MAX_EAGER_BRIDGE_TOOL_BYTES),
+      registerTenant: (tenantKey, tenant) => this.tenants.set(tenantKey, tenant),
+      observeConfigOptions: options => this.observeSlotCatalog(slot, options, undefined),
+      permission: request => this.answerPermission(conv, request),
+      warn: message => this.host.log.warn(message),
+    })
     try {
       const result = await proc.newSession({
-        cwd: this.preflight?.workspace ?? this.home,
-        mcpServers,
-        _meta: { antigravity: { systemPrompt: { append: bridgeSystemPrompt(system) } } },
-      }, {
-        onUpdate: (update) => {
-          if (update.sessionUpdate === 'config_option_update' && Array.isArray(update.configOptions)) {
-            conv.configOptions = update.configOptions
-            if (this.catalog.observe(update.configOptions)) this.host.onModelsChanged()
-          }
-          if (recordReportedToolCall(conv, update) === 'conflict') {
-            this.host.log.warn(`antigravity-acp: agent reported conflicting identity for tool call ${String(update.toolCallId)}`)
-          }
-          conv.turn?.onUpdate(update)
-        },
-        onPermission: request => this.answerPermission(conv, request),
-      }, 120_000)
+        cwd: slot.layout.workspace,
+        mcpServers: mount.mcpServers,
+        _meta: { antigravity: { systemPrompt: { append: mount.systemAppend } } },
+      }, mount.listener, 120_000)
       conv.sessionId = result.sessionId
       conv.process = proc
       conv.configOptions = result.configOptions ?? []
       conv.model = undefined
       conv.effort = undefined
-      conv.usageCursor = -1
+      this.resetUsageReading(conv)
       conv.dirty = false
       conv.issuedIds.clear()
-      if (this.catalog.observe(result.configOptions, result.models?.availableModels)) this.host.onModelsChanged()
+      this.observeSlotCatalog(slot, result.configOptions, result.models?.availableModels)
     } catch (error) {
-      this.releaseTenant(conv)
-      conv.tenantKey = undefined
-      conv.tenantSecret = undefined
-      conv.advertisedTools = []
-      conv.advertisedToolNames.clear()
-      conv.knownTools.clear()
+      detachBridge(conv, tenant => this.releaseTenant(tenant))
       throw mapError(error)
     }
   }
@@ -585,137 +1531,31 @@ export class AntigravityRuntime {
     return timingSafeEqual(left, right)
   }
 
-  /** Drop one conversation's tenant registration together with its bridge handshake evidence. */
   private releaseTenant(conv: Conversation): void {
     if (conv.tenantKey === undefined) return
     this.tenants.delete(conv.tenantKey)
     this.bridge.forgetTenant(conv.tenantKey)
   }
 
-  /**
-   * Decide one `session/request_permission` from structured host-reported
-   * metadata only. `title` and `rawInput` are never matched against tool
-   * names: a native tool whose payload merely contains `mcp_dsh_…` or a
-   * spoofed title must not unlock the bridge.
-   */
   private answerPermission(conv: Conversation, request: AcpPermissionRequest): AcpPermissionOutcome {
-    const pick = (kind: string): AcpPermissionOutcome | undefined => {
-      const option = request.options.find(o => o.kind === kind)
-      return option === undefined ? undefined : { outcome: 'selected', optionId: option.optionId }
-    }
-    const reject = (reason: string): AcpPermissionOutcome => {
-      this.host.log.warn(`antigravity-acp: refused permission request (${reason}): ${request.toolCall?.title ?? 'unknown'}`)
-      return pick('reject_once') ?? { outcome: 'cancelled' }
-    }
-    if (conv.sessionId === undefined || request.sessionId !== conv.sessionId) return reject('session mismatch')
-    if (conv.tenantKey === undefined) return reject('no MCP bridge is mounted for this session')
-    if (conv.turn === undefined || conv.turn.finished) return reject('no live turn')
-    const toolCallId = request.toolCall?.toolCallId
-    if (typeof toolCallId !== 'string' || toolCallId.length === 0) return reject('missing toolCallId')
-    const reported = conv.reportedToolCalls.get(toolCallId)
-    const claimed = structuredToolMeta(request.toolCall)
-    if (reported === undefined) {
-      // Nothing the agent reported in `session/update` backs this call: its own
-      // in-request metadata is untrusted (stale or cross-session toolCallId).
-      if (claimed.serverName !== undefined || claimed.toolName !== undefined) {
-        return reject(`tool call ${toolCallId} was never reported by the agent`)
-      }
-      // The only identity-less exception is the agent's MCP loading probe
-      // (no tool name, no input), and it must be bound to explicit evidence:
-      // this tenant itself completed the MCP handshake with its bearer secret.
-      // Even then the probe is never granted `allow_always`.
-      if (request.toolCall?.kind === 'other' && isEmptyInput(request.toolCall.rawInput)) {
-        if (!this.bridge.hasHandshake(conv.tenantKey)) {
-          return reject('identity-less probe without a completed MCP handshake')
-        }
-        return pick('allow_once') ?? { outcome: 'cancelled' }
-      }
-      return reject('missing structured tool metadata')
-    }
-    if (reported.conflict === true) {
-      return reject(`reported identity of tool call ${toolCallId} conflicts across agent updates`)
-    }
-    if (claimed.serverName !== undefined && claimed.serverName !== reported.serverName) return reject('MCP server name conflict')
-    if (claimed.toolName !== undefined && claimed.toolName !== reported.toolName) return reject('tool name conflict')
-    if (reported.serverName !== MCP_SERVER_NAME) return reject(`unknown MCP server ${reported.serverName ?? '(none)'}`)
-    const allowedTools = new Set([...conv.advertisedToolNames, AWAIT_TOOL_NAME, CALL_TOOL_NAME])
-    if (reported.toolName === undefined || !allowedTools.has(reported.toolName)) {
-      return reject(`tool is not offered to this session: ${reported.toolName ?? '(none)'}`)
-    }
-    return pick('allow_once') ?? { outcome: 'cancelled' }
+    return decidePermission(permissionState(conv), request, {
+      hasHandshake: tenantKey => this.bridge.hasHandshake(tenantKey),
+      warn: message => this.host.log.warn(message),
+    })
   }
 
-  private async select(conv: Conversation, proc: AcpProcess, model: string, effort: Effort): Promise<void> {
-    const sessionId = conv.sessionId as string
-    const modelOption = conv.configOptions.find(o => o.id === 'model' || o.category === 'model')
-    if (modelOption?.options !== undefined && !modelOption.options.some(o => o.value === model)) {
-      throw new LlmError(`Antigravity does not offer model "${model}" to this account; available: ${modelOption.options.map(o => o.value).join(', ')}`, 'UNKNOWN_MODEL')
+  private async select(conv: Conversation, proc: AcpProcess, model: string, effort: Effort): Promise<boolean> {
+    if (!this.servesModel(conv.accountId, model)) {
+      throw new LlmError(labeled('UNKNOWN_MODEL', `Antigravity account "${conv.accountId ?? 'auto'}" is not allowed to serve model "${model}".`), 'UNKNOWN_MODEL')
     }
-    if (conv.model !== model && modelOption?.currentValue !== model) {
-      conv.configOptions = await proc.setConfigOption(sessionId, modelOption?.id ?? 'model', model).catch((error: unknown) => { throw mapError(error) })
-    }
-    conv.model = model
-    const levelOption = conv.configOptions.find(o => o.id === 'thought_level' || o.category === 'thought_level')
-    // Fixed-variant families (GPT-OSS) reject every thought_level change; the
-    // effort already lives in the model id, so only selectable families write it.
-    const selectable = this.catalog.effortsFor(model)
-    if (selectable.length > 0 && levelOption !== undefined && conv.effort !== effort && levelOption.currentValue !== effort) {
-      conv.configOptions = await proc.setConfigOption(sessionId, levelOption.id, effort).catch((error: unknown) => { throw mapError(error) })
-    }
-    conv.effort = effort
+    return applyModelAndEffort(conv, proc, model, effort, {
+      selectableEfforts: id => this.catalog.effortsFor(id),
+      fail: mapError,
+    })
   }
 
-  private plan(conv: Conversation, system: string, messages: readonly RequestMessage[]): PromptPlan {
-    const reusable = conv.sessionId !== undefined
-      && !conv.dirty
-      && conv.purpose === MAIN_PURPOSE
-      && this.historyPrefixIntact(conv, system, messages)
-    if (reusable) {
-      const known = conv.knownIds as string[]
-      let rest = messages.slice(known.length)
-      let skip = 0
-      while (skip < rest.length && this.isOwn(conv, rest[skip] as RequestMessage)) skip++
-      rest = rest.slice(skip)
-      if (rest.length > 0 && rest.every(m => m.role === 'user' || m.role === 'developer' || m.role === 'system')) {
-        return { rebuild: false, history: [], input: rest }
-      }
-    }
-    let cut = messages.length
-    while (cut > 0) {
-      const role = messages[cut - 1]?.role
-      if (role !== 'user' && role !== 'developer' && role !== 'system') break
-      cut--
-    }
-    return { rebuild: true, history: messages.slice(0, cut), input: messages.slice(cut) }
-  }
-
-  /**
-   * Whether the live ACP session's context is still an exact prefix of the
-   * request: the same system prompt and the same message ids in the same order.
-   * A compaction checkpoint, a pruned/rewritten prefix, or a replaced system
-   * prompt all make the session stale and force a rebuild.
-   * @param conv - conversation owning the ACP session.
-   * @param system - current DSH system prompt.
-   * @param messages - full request history after leading system messages.
-   * @returns true when only new messages were appended.
-   */
-  private historyPrefixIntact(conv: Conversation, system: string, messages: readonly RequestMessage[]): boolean {
-    // plan() has always required the same system digest for reuse; a changed
-    // digest is a genuinely new prompt, while mid-conversation updates travel
-    // as `system` messages inside `messages` (systemPromptUpdate: 'in-history').
-    if (conv.knownIds === undefined || conv.systemHash !== digest(system)) return false
-    const known = conv.knownIds
-    return known.length <= messages.length
-      && known.every((id, index) => messages[index]?.id === id)
-  }
-
-  private isOwn(conv: Conversation, message: RequestMessage): boolean {
-    if (message.role === 'assistant') return message.source.kind === 'model' && message.source.provider === this.host.config.provider
-    if (message.role === 'tool') return conv.issuedIds.has(message.toolCallId)
-    return false
-  }
-
-  private async resetSession(conv: Conversation): Promise<void> {
+  private async resetSession(conv: Conversation, keepPersisted = false): Promise<void> {
+    if (!keepPersisted) this.sessions.forget(conv.dshSessionId)
     if (conv.sessionId !== undefined && conv.process !== undefined) {
       void conv.process.closeSession(conv.sessionId)
     }
@@ -728,68 +1568,283 @@ export class AntigravityRuntime {
     conv.advertisedToolNames.clear()
     conv.knownTools.clear()
     conv.reportedToolCalls.clear()
-    conv.usageCursor = -1
+    this.resetUsageReading(conv)
+    conv.health = conv.health.reset()
+    conv.reanswer = freshReanswer()
     conv.knownIds = undefined
     conv.dirty = false
   }
 
   private startPrompt(conv: Conversation, proc: AcpProcess, blocks: AcpPromptBlock[]): void {
     const turn = conv.turn as AcpTurn
-    proc.prompt(conv.sessionId as string, blocks).then(
-      result => turn.events.push({ kind: 'done', result }),
-      (error: unknown) => turn.events.push({ kind: 'error', error: mapError(error) }),
+    const generation = ++conv.promptGen
+    const p = proc.prompt(conv.sessionId as string, blocks).then(
+      (result) => {
+        if (conv.turn === turn && conv.promptGen === generation) turn.events.push({ kind: 'done', result })
+      },
+      (error: unknown) => {
+        if (conv.turn === turn && conv.promptGen === generation) turn.events.push({ kind: 'error', error: mapError(error) })
+      },
+    )
+    conv.promptSettled = p.then(() => undefined, () => undefined)
+  }
+
+  /**
+   * Start one turn's usage reading after everything the session DB already holds:
+   * the merged `gen_metadata` cursor and, for the legacy fallback only, the `steps`
+   * cursor. Each entry point re-pins both, so no turn reports an earlier turn's rows.
+   * @param conv - the conversation starting a turn.
+   * @param dbPath - path to its session DB.
+   */
+  private pinUsageCursors(conv: Conversation, dbPath: string): void {
+    conv.genMetaCursor = peekMaxGenMetadataIdx(dbPath)
+    conv.usageCursor = peekMaxModelStepIdx(dbPath)
+  }
+
+  /**
+   * Forget everything known about one ACP session's usage reading: its cursors, the
+   * table it reads, and the steps already back-filled from `steps`.
+   * @param conv - the conversation whose ACP session is replaced.
+   */
+  private resetUsageReading(conv: Conversation): void {
+    conv.usageSource = undefined
+    conv.genMetaCursor = -1
+    conv.usageCursor = -1
+    conv.backfilledSteps = 0
+  }
+
+  /**
+   * Which table reports this ACP session's per-step usage. Decided once per session,
+   * when the session DB exists: a DB carrying `gen_metadata` rows is read only through
+   * the merged generation path, so one generation is never billed by both paths; an
+   * old `agy` without the table keeps reading `steps`, exactly as before.
+   * @param conv - the conversation being read.
+   * @param dbPath - path to its session DB.
+   * @returns the source, or `undefined` while the DB does not exist yet.
+   */
+  private usageSource(conv: Conversation, dbPath: string): 'gen' | 'steps' | undefined {
+    if (conv.usageSource !== undefined) return conv.usageSource
+    if (!existsSync(dbPath)) return undefined
+    conv.usageSource = hasGenMetadata(dbPath) ? 'gen' : 'steps'
+    return conv.usageSource
+  }
+
+  /**
+   * The one read path: read the generations committed since the last read, judge their
+   * route health, and stage their usage for the DSH step that is ending. The same batch
+   * therefore reports the usage and feeds the fingerprint without being read twice.
+   * @param conv - the conversation reading its own session DB.
+   * @param dbPath - path to that session DB.
+   * @param model - model that produced the generations.
+   * @param effort - resolved reasoning effort.
+   * @param options - whether the ending step is a tool step, whether its last
+   * generation could still be refused, and how many polls to allow while the expected
+   * row has not been committed yet.
+   * @returns the verdict of the last billed generation, when any.
+   */
+  private async readGenStepSample(
+    conv: Conversation,
+    dbPath: string,
+    model: string,
+    effort: Effort,
+    options: { isToolStep: boolean; isInterceptable?: boolean; polls?: number },
+  ): Promise<DegradeFingerprintResult | undefined> {
+    let batch = readGenUsageAfter(dbPath, conv.genMetaCursor)
+    for (let attempt = 0; batch === undefined && attempt < (options.polls ?? 3); attempt++) {
+      await delay(15)
+      batch = readGenUsageAfter(dbPath, conv.genMetaCursor)
+    }
+    if (batch === undefined) return undefined
+    // The cursor advances past the all-zero rows too: a failed or refused request has
+    // no step behind it, and its row must never be read a second time.
+    conv.genMetaCursor = batch.maxIdx
+    if (batch.calls === 0) return undefined
+    conv.turn?.stageStepUsage(batch)
+    return conv.health.observeGenBatchHealth(model, effort, batch, options.isToolStep, options.isInterceptable ?? options.isToolStep)
+  }
+
+  /**
+   * Reconcile one finished ACP turn: when the session DB holds more completed model
+   * steps than billed `gen_metadata` rows, `agy` never committed the last steps'
+   * generation rows, so their usage is back-filled from `steps` and judged without the
+   * pre-send context estimate. Each table is counted in its own coordinates (the two
+   * `idx` columns are unrelated), so a gap is found by count and reported once.
+   * @param conv - the conversation whose turn just ended.
+   * @param dbPath - path to its session DB.
+   * @param model - model that produced the steps.
+   * @param effort - resolved reasoning effort.
+   */
+  private reconcileTurnUsage(conv: Conversation, dbPath: string, model: string, effort: Effort): void {
+    const stepsDone = readModelStepsAfter(dbPath, -1)?.calls ?? 0
+    const genBilled = readGenUsageAfter(dbPath, -1)?.calls ?? 0
+    const missing = stepsDone - genBilled - conv.backfilledSteps
+    if (missing <= 0) return
+    const gap = readModelStepTail(dbPath, missing)
+    if (gap === undefined) return
+    conv.backfilledSteps += gap.calls
+    conv.turn?.stageStepUsage(gap)
+    conv.health.observeStepBatchHealth(model, effort, gap)
+    this.host.log.warn(
+      `antigravity-acp: usage-gap ${basename(dbPath)}: back-filled ${gap.usage.totalTokens ?? 0} tokens from ${gap.calls} completed step(s) that gen_metadata never billed (${stepsDone} steps, ${genBilled} billed generations)`,
     )
   }
 
-  private async * pump(conv: Conversation, proc: AcpProcess, options: GenerateOptions, effort: Effort): AsyncGenerator<StreamChunk> {
+  private async * pump(
+    conv: Conversation,
+    slot: AccountSlot,
+    proc: AcpProcess,
+    options: GenerateOptions,
+    effort: Effort,
+    ctx: PumpContext,
+  ): AsyncGenerator<StreamChunk> {
     const turn = conv.turn as AcpTurn
-    const sessionId = conv.sessionId as string
+    const holdZeroThoughtText = conv.purpose === MAIN_PURPOSE && /argon/i.test(options.model) && effort === 'high'
     let finishKind: string | undefined
     try {
       for await (const chunk of pumpStep(turn, {
         parkSettleMs: this.host.config.parkSettleMs,
         maxContinuations: this.longDecodeContinuations(),
-        continuePrompt: () => proc.prompt(sessionId, [{ type: 'text', text: CONTINUE_PROMPT }]),
-        cancel: () => proc.cancel(sessionId),
+        holdZeroThoughtText,
+        continuePrompt: () => proc.prompt(conv.sessionId as string, [{ type: 'text', text: CONTINUE_PROMPT }]),
+        cancel: () => {
+          if (conv.sessionId !== undefined) proc.cancel(conv.sessionId)
+        },
         recordUsage: (usage, steps) => {
           this.lastTurn = { model: options.model, effort, steps, ...usage !== undefined ? { usage } : {}, at: new Date().toISOString() }
         },
-        consumeStepUsage: async () => {
-          const dbPath = sessionDbPath(this.home, sessionId)
-          if (!existsSync(dbPath)) return undefined
-          let batch = readModelStepsAfter(dbPath, conv.usageCursor)
-          for (let attempt = 0; batch === undefined && attempt < 3; attempt++) {
-            await delay(25)
-            batch = readModelStepsAfter(dbPath, conv.usageCursor)
+        verifyEndTurn: async () => {
+          if (conv.purpose !== MAIN_PURPOSE || !/argon/i.test(options.model) || conv.sessionId === undefined) {
+            return 'ok'
           }
-          if (batch === undefined) return undefined
-          conv.usageCursor = batch.maxIdx
-          turn.recordStepBatch(batch)
-          return { usage: batch.usage, calls: batch.calls }
+          const dbPath = sessionDbPath(slot.layout.geminiDir, conv.sessionId)
+          if (!existsSync(dbPath)) return 'ok'
+          if (this.usageSource(conv, dbPath) !== 'gen') return 'ok'
+          // The merged read both reports this step's usage and judges its route, so
+          // the answer is refused before the usage chunk is ever produced.
+          const verdict = await this.readGenStepSample(conv, dbPath, options.model, effort, {
+            isToolStep: false,
+            isInterceptable: false,
+          })
+          if (verdict?.degraded !== true) return 'ok'
+          conv.health.noteDegradedAttempt(verdict, options.model)
+          if (conv.reanswer.granted >= MAX_REANSWERS_PER_REQUEST) {
+            // The budget is spent: deliver this degraded answer as it is.
+            return 'ok'
+          }
+          conv.health.interceptedSteps += 1
+          conv.reanswer.granted += 1
+          conv.reanswer.awaiting = true
+          conv.reanswer.freshSession = false
+          // The refused answer is never delivered, so its usage is never reported.
+          turn.discardStagedUsage()
+          return 'degrade'
+        },
+        consumeStepUsage: async (sampleOptions) => {
+          const currentSessionId = conv.sessionId as string
+          const dbPath = sessionDbPath(slot.layout.geminiDir, currentSessionId)
+          if (!existsSync(dbPath)) return undefined
+          const source = this.usageSource(conv, dbPath)
+          if (source === 'steps') {
+            // Legacy fallback for an old `agy` without `gen_metadata`: completed steps
+            // stay the only usage and health source, exactly as before the merge.
+            let batch = readModelStepsAfter(dbPath, conv.usageCursor)
+            for (let attempt = 0; batch === undefined && attempt < 3; attempt++) {
+              await delay(25)
+              batch = readModelStepsAfter(dbPath, conv.usageCursor)
+            }
+            if (batch === undefined) return undefined
+            conv.usageCursor = batch.maxIdx
+            conv.health.observeStepBatchHealth(options.model, effort, batch)
+            turn.recordStepBatch(batch)
+            const lastStep = batch.steps[batch.steps.length - 1]
+            if (batch.steps.length > 1 && lastStep !== undefined) {
+              const sumOut = batch.usage.outputTokens ?? 0
+              const sumThought = batch.usage.thoughtTokens ?? 0
+              const latestUsage: NonNullable<AcpPromptResult['usage']> = {
+                inputTokens: lastStep.inputTokens,
+                outputTokens: sumOut,
+                cachedReadTokens: lastStep.cachedReadTokens,
+                cachedWriteTokens: lastStep.cachedWriteTokens,
+                thoughtTokens: sumThought,
+                totalTokens: lastStep.inputTokens + lastStep.cachedReadTokens + lastStep.cachedWriteTokens + sumOut,
+              }
+              return { usage: latestUsage, calls: 1 }
+            }
+            return { usage: batch.usage, calls: batch.calls }
+          }
+          if (source !== 'gen') return undefined
+          // A tool step already read its generation in the gate and a text step in the
+          // end-of-turn check; reading again would only find an empty cursor.
+          if (!turn.hasStagedUsage()) {
+            await this.readGenStepSample(conv, dbPath, options.model, effort, { isToolStep: false, isInterceptable: false })
+          }
+          if (sampleOptions.final) {
+            // Last step of the ACP turn: the only point where a tail `gen_metadata`
+            // never billed can still be reported inside this step's usage.
+            this.reconcileTurnUsage(conv, dbPath, options.model, effort)
+          }
+          const staged = turn.takeStepUsage()
+          if (staged === undefined) return undefined
+          turn.recordStepBatch(staged)
+          const lastStep = staged.steps[staged.steps.length - 1]
+          if (staged.steps.length > 1 && lastStep !== undefined) {
+            const sumOut = staged.usage.outputTokens ?? 0
+            const sumThought = staged.usage.thoughtTokens ?? 0
+            const latestUsage: NonNullable<AcpPromptResult['usage']> = {
+              inputTokens: lastStep.inputTokens,
+              outputTokens: sumOut,
+              cachedReadTokens: lastStep.cachedReadTokens,
+              cachedWriteTokens: lastStep.cachedWriteTokens,
+              thoughtTokens: sumThought,
+              totalTokens: lastStep.inputTokens + lastStep.cachedReadTokens + lastStep.cachedWriteTokens + sumOut,
+            }
+            return { usage: latestUsage, calls: 1 }
+          }
+          return { usage: staged.usage, calls: staged.calls }
         },
       }, options.signal)) {
         if (chunk.type === 'block-end' && chunk.block.type === 'tool-call') conv.issuedIds.add(chunk.block.id)
+        if (chunk.type === 'usage') this.noteUsage(slot, chunk.usage)
         if (chunk.type === 'finish') finishKind = chunk.reason.kind
         yield chunk
       }
     } catch (error) {
+      if (isReanswerFailure(error)) {
+        // A degraded step keeps its ACP session: only the answer was refused.
+        // Nothing is persisted or forgotten, so the harness retry re-asks the
+        // identical request and the plugin can re-answer in place.
+        conv.promptGen++
+        conv.reportedToolCalls.clear()
+        conv.turn = undefined
+        if (failureCode(error) === 'DEGRADED_ROUTE') conv.knownIds = ctx.nextKnownIds
+        await Promise.race([conv.promptSettled, delay(3_000)])
+        throw error
+      }
       conv.reportedToolCalls.clear()
       conv.turn = undefined
       conv.dirty = true
+      this.sessions.forget(conv.dshSessionId)
       throw mapError(error)
     }
-    if (finishKind === 'tool-calls') return
-    if (finishKind === 'aborted') {
-      // A cancelled turn leaves partial agent-side history; rebuild from DSH history next time.
-      await Promise.race([turnSettled(turn), delay(5_000)])
-      conv.dirty = true
+    if (finishKind === 'tool-calls') {
+      conv.knownIds = ctx.nextKnownIds
+      return
     }
-    // The turn is over: clear the identities it established with it.
+    if (finishKind === 'aborted') {
+      await turnSettled(turn, 5_000)
+      conv.dirty = true
+      this.sessions.forget(conv.dshSessionId)
+    } else {
+      conv.knownIds = ctx.nextKnownIds
+      conv.reanswer.rounds += 1
+      conv.health.finalizeTurnHealth(options.model)
+      this.persistConversation(conv)
+    }
     conv.reportedToolCalls.clear()
     conv.turn = undefined
   }
 
-  private async deliverResults(conv: Conversation, messages: readonly RequestMessage[], proc: AcpProcess, tools: readonly BridgeTool[]): Promise<boolean> {
+  private async deliverResults(conv: Conversation, slot: AccountSlot, messages: readonly RequestMessage[], proc: AcpProcess, tools: readonly BridgeTool[]): Promise<boolean> {
     const turn = conv.turn as AcpTurn
     const results = new Map<string, Extract<RequestMessage, { role: 'tool' }>>()
     let last = -1
@@ -802,20 +1857,19 @@ export class AntigravityRuntime {
     if (results.size !== turn.pendingCalls.size) return false
     const extras = messages.slice(last + 1)
     if (extras.some(m => m.role === 'assistant' || m.role === 'tool')) return false
-    const extraText = extras.length > 0 ? renderTranscript(extras) : ''
+    const nonPureExtras = extras.filter(
+      m => !(m.role === 'developer' && m.content.length > 0 && m.content.every(b => b.type === 'tool-addition' || b.type === 'tool-removal')),
+    )
+    const extraText = nonPureExtras.length > 0 ? renderTranscript(nonPureExtras) : ''
     const toolDelta = consumeToolDelta(conv, tools)
     const suffix = [toolDelta, extraText].filter(Boolean).join('\n\n')
     const pending = [...turn.pendingCalls.values()]
     turn.pendingCalls.clear()
     if (turn.finished || !this.isTurnLive(turn)) {
-      // The agent ended its turn while the harness ran the tools: hand the results over as new input.
       const transcript = renderTranscript(pending.map(call => results.get(call.id) as RequestMessage))
-      // The old turn is over: its reported identities do not carry into the continuation.
       conv.reportedToolCalls.clear()
       conv.turn = new AcpTurn(this.nextTurnTag(messages))
-      if (conv.sessionId !== undefined) {
-        conv.usageCursor = peekMaxModelStepIdx(sessionDbPath(this.home, conv.sessionId))
-      }
+      if (conv.sessionId !== undefined) this.pinUsageCursors(conv, sessionDbPath(slot.layout.geminiDir, conv.sessionId))
       this.startPrompt(conv, proc, [{ type: 'text', text: `${transcript}${suffix ? `\n\n${suffix}` : ''}\n\nContinue the task with these tool results.` }])
       return true
     }
@@ -859,9 +1913,9 @@ export class AntigravityRuntime {
     conv.turn = undefined
     conv.dirty = true
     conv.reportedToolCalls.clear()
+    this.sessions.forget(conv.dshSessionId)
   }
 
-  /** A conversation is idle only when no turn is running and no session is opening. */
   private isIdle(conv: Conversation): boolean {
     return conv.turn === undefined && !conv.opening
   }
@@ -874,7 +1928,6 @@ export class AntigravityRuntime {
       this.conversations.delete(conv.key)
       return
     }
-    // A failed opening leaves an unusable empty shell: release its capacity slot.
     if (idle && conv.sessionId === undefined && this.conversations.get(conv.key) === conv) {
       this.conversations.delete(conv.key)
     }
@@ -886,9 +1939,75 @@ export class AntigravityRuntime {
     return [...conv.advertisedTools, AWAIT_TOOL, CALL_TOOL]
   }
 
+  /**
+   * Judge the `gen_metadata` row of the generation that is about to run one
+   * tool call. A degraded route never executes the tool: the call is refused,
+   * the prompt is cancelled, and the step fails with `DEGRADED_ROUTE` so the
+   * harness re-asks the identical request and the plugin re-answers.
+   * @param conv - the conversation issuing the call.
+   * @param turn - its live ACP turn.
+   * @param signal - DSH cancellation of the MCP call.
+   * @returns an error result that refuses the call, or undefined to allow it.
+   */
+  private async evaluateToolGate(
+    conv: Conversation,
+    turn: AcpTurn,
+    signal: AbortSignal,
+  ): Promise<BridgeToolResult | undefined> {
+    if (
+      conv.purpose !== MAIN_PURPOSE
+      || conv.sessionId === undefined
+      || conv.accountId === undefined
+      || !/argon/i.test(conv.model ?? '')
+    ) {
+      return undefined
+    }
+    const slot = this.slots.get(conv.accountId)
+    if (slot === undefined) return undefined
+    const dbPath = sessionDbPath(slot.layout.geminiDir, conv.sessionId)
+    if (!existsSync(dbPath)) return undefined
+    if (this.usageSource(conv, dbPath) !== 'gen') return undefined
+    const model = conv.model ?? 'gemini-4-argon'
+    const effort = conv.effort ?? this.defaultEffort()
+
+    let verdict: DegradeFingerprintResult | undefined
+    const unlock = await this.gateMutex.acquire(conv.key)
+    try {
+      // The merged read judges the generation that is about to run this tool call and
+      // stages its usage for the step that ends when the call is handed over.
+      verdict = await this.readGenStepSample(conv, dbPath, model, effort, { isToolStep: true })
+    } finally {
+      unlock()
+    }
+    if (verdict?.degraded !== true) return undefined
+    if (signal.aborted) return { content: [{ type: 'text', text: 'The tool call was cancelled.' }], isError: true }
+
+    conv.health.noteDegradedAttempt(verdict, model)
+    // The refused generation is never delivered, so its usage is never reported.
+    turn.discardStagedUsage()
+    const exhausted = conv.reanswer.granted >= MAX_REANSWERS_PER_REQUEST
+    if (!exhausted) {
+      conv.health.interceptedSteps += 1
+      conv.reanswer.granted += 1
+      conv.reanswer.awaiting = true
+      // Only a cold session that never finished a round cannot be continued in
+      // place once its turn was cancelled mid-tool-call.
+      conv.reanswer.freshSession = conv.reanswer.rounds === 0 && turn.toolSteps === 0
+    }
+    if (conv.sessionId !== undefined) conv.process?.cancel(conv.sessionId)
+    turn.events.push({ kind: 'error', error: exhausted ? degradedExhaustedError() : degradedRouteError() })
+    return {
+      content: [{
+        type: 'text',
+        text: exhausted
+          ? 'Upstream kept routing this attempt to a degraded fallback node; the harness aborted the step and this tool call was NOT executed.'
+          : 'Upstream routed this attempt to a degraded fallback node; the harness is re-answering the same request, so this tool call was NOT executed and no state changed.',
+      }],
+      isError: true,
+    }
+  }
+
   private async callTool(request: BridgeCallRequest): Promise<BridgeToolResult> {
-    // Only the tenant mounted for this exact conversation may drive its tools;
-    // a bare `conversationId` never grants routing on its own.
     const conv = request.tenantKey !== undefined ? this.tenants.get(request.tenantKey) : undefined
     if (conv === undefined) {
       return { content: [{ type: 'text', text: 'No harness turn is waiting for this tool call.' }], isError: true }
@@ -917,12 +2036,16 @@ export class AntigravityRuntime {
       if (!conv.toolNames.has(targetName)) {
         return { content: [{ type: 'text', text: `The harness has no tool named ${targetName}.` }], isError: true }
       }
+      const gated = await this.evaluateToolGate(conv, turn, request.signal)
+      if (gated !== undefined) return gated
       const call = turn.park(targetName, targetArgs)
       return this.awaitCall(turn, call, request.signal)
     }
     if (!conv.toolNames.has(request.name)) {
       return { content: [{ type: 'text', text: `The harness has no tool named ${request.name}.` }], isError: true }
     }
+    const gated = await this.evaluateToolGate(conv, turn, request.signal)
+    if (gated !== undefined) return gated
     const call = turn.park(request.name, request.arguments)
     return this.awaitCall(turn, call, request.signal)
   }
@@ -953,10 +2076,89 @@ export class AntigravityRuntime {
     const now = Date.now()
     for (const conv of [...this.conversations.values()]) {
       if (this.isIdle(conv) && now - conv.lastUsed > ttl) {
-        void this.resetSession(conv)
+        this.persistConversation(conv)
+        void this.resetSession(conv, true)
         this.conversations.delete(conv.key)
       }
     }
+    const busy = new Set<string>()
+    for (const conv of this.conversations.values()) {
+      if (conv.sessionId !== undefined && conv.accountId !== undefined) busy.add(conv.accountId)
+    }
+    for (const slot of this.slots.values()) {
+      if (slot.process === undefined || busy.has(slot.layout.id)) continue
+      if (now - Math.max(this.pool.lastUsed(slot.layout.id), slot.readyAt) < ttl) continue
+      slot.process.stop()
+      slot.process = undefined
+      slot.state = 'idle'
+    }
+  }
+
+  /**
+   * Prepare an account sandbox and start an interactive sign-in.
+   * @param accountId - account to sign in.
+   * @returns the authorization URL and a terminal command fallback.
+   */
+  async beginLogin(accountId: string): Promise<LoginTicket> {
+    const slot = this.slotFor(accountId)
+    const binary = this.binary ?? resolveAgyBinary(this.host.config.command)
+    this.binary = binary
+    await ensureLayout(slot.layout, this.host.runCommand)
+    const command = loginCommand(slot.layout, binary)
+    this.logins.get(accountId)?.child.terminate()
+    this.logins.delete(accountId)
+    const child = this.host.spawnAcp([binary, 'acp', '--login'], slot.layout.workspace, slot.env)
+    const url = await readLoginUrl(child, 45_000)
+    if (url.length === 0) {
+      child.terminate()
+      throw new LlmError(`Antigravity returned no sign-in URL for account "${accountId}". Run this in a terminal instead: ${command}`, 'AUTH')
+    }
+    void child.exited.then(() => { if (this.logins.get(accountId)?.child === child) this.logins.delete(accountId) })
+    this.logins.set(accountId, { child, url })
+    return { accountId, url, command }
+  }
+
+  /**
+   * Finish an interactive sign-in with the authorization code from the browser.
+   * @param accountId - account being signed in.
+   * @param code - authorization code pasted from the browser.
+   * @returns whether the account now holds a credential.
+   */
+  async completeLogin(accountId: string, code: string): Promise<LoginResult> {
+    const session = this.logins.get(accountId)
+    if (session === undefined) return { ok: false, email: undefined, error: 'No sign-in is pending for this account.' }
+    const slot = this.slotFor(accountId)
+    session.child.stdin.write(`${code.trim()}\n`)
+    const outcome = await Promise.race([session.child.exited, delay(120_000).then(() => 'timeout' as const)])
+    if (this.logins.get(accountId)?.child === session.child) this.logins.delete(accountId)
+    if (outcome === 'timeout') {
+      session.child.terminate()
+      return { ok: false, email: undefined, error: 'The sign-in did not finish within 120 seconds.' }
+    }
+    let email = await readAccountEmail(slot.layout, this.host.runCommand).catch(() => undefined)
+    for (let attempt = 0; email === undefined && outcome.code === 0 && attempt < 3; attempt++) {
+      await delay(150)
+      email = await readAccountEmail(slot.layout, this.host.runCommand).catch(() => undefined)
+    }
+    slot.email = email
+    this.quota.clear()
+    const ok = email !== undefined || outcome.code === 0
+    return {
+      ok,
+      email,
+      error: ok ? undefined : `agy exited with code ${String(outcome.code)} ${session.child.stderrTail()}`.trim(),
+    }
+  }
+
+  /**
+   * Abandon a pending sign-in.
+   * @param accountId - account whose sign-in should stop.
+   */
+  cancelLogin(accountId: string): void {
+    const session = this.logins.get(accountId)
+    if (session === undefined) return
+    this.logins.delete(accountId)
+    session.child.terminate()
   }
 
   /**
@@ -994,176 +2196,116 @@ function collectUsedTurnTags(messages: readonly RequestMessage[], into: Set<stri
   }
 }
 
+async function readLoginUrl(child: AcpChild, timeoutMs: number): Promise<string> {
+  let buffer = ''
+  const match = (): string | undefined => /https:\/\/accounts\.google\.com\/[^\s"'<>]+/.exec(buffer)?.[0]
+  return new Promise<string>((resolve) => {
+    const finish = (): void => {
+      clearTimeout(timer)
+      child.stdout.off('data', onData)
+      resolve(match() ?? '')
+    }
+    const onData = (chunk: Buffer | string): void => {
+      buffer += chunk.toString()
+      if (match() !== undefined) finish()
+    }
+    const timer = setTimeout(finish, timeoutMs)
+    child.stdout.on('data', onData)
+    void child.exited.then(finish, finish)
+  })
+}
+
+function isUnknownModelFailure(error: unknown): boolean {
+  return (error as { code?: unknown } | null)?.code === 'UNKNOWN_MODEL'
+}
+
+function isQuotaFailure(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code
+  if (code === 'QUOTA' || code === 'RATE_LIMIT') return true
+  const message = error instanceof Error ? error.message : String(error)
+  return /quota|resource.?exhausted|limit reached|exceeded your|rate.?limit|429|too many requests/i.test(message)
+}
+
+/**
+ * Identity of one model request: its message ids, system digest, model, and
+ * purpose. DSH's request-retry layer repeats a failed step with the identical
+ * request, which is exactly what this key recognizes.
+ * @param options - the request.
+ * @param system - its system text.
+ * @returns the opaque key.
+ */
+function reanswerKey(options: GenerateOptions, system: string): string {
+  return `${String((options as { purpose?: string }).purpose ?? '')}|${options.model}|${digest(system)}|${messageIds(options.messages).join(',')}`
+}
+
+/**
+ * Stable failure code of an error. Errors raised inside the plugin already
+ * carry one; anything else is classified through {@link mapError}, so a plain
+ * transport failure is judged by the same wording the transcript would show.
+ * @param error - the failure.
+ * @returns the code, or undefined when none can be derived.
+ */
+function failureCode(error: unknown): string | undefined {
+  const own = (error as { code?: unknown } | null)?.code
+  if (typeof own === 'string' && own.length > 0) return own
+  const mapped = mapError(error) as { code?: unknown }
+  return typeof mapped.code === 'string' && mapped.code.length > 0 ? mapped.code : undefined
+}
+
+/**
+ * Parse a duration such as `41.2s`, `45m`, or `2h3m4s` into milliseconds.
+ * @param text - the duration token.
+ * @returns the duration, or undefined when the token is not one.
+ */
+function parseDurationMs(text: string): number | undefined {
+  const match = /^(?:(\d+(?:\.\d+)?)h)?(?:(\d+(?:\.\d+)?)m)?(?:(\d+(?:\.\d+)?)s)?$/i.exec(text.trim())
+  if (match === null) return undefined
+  const [, hours, minutes, seconds] = match
+  if (hours === undefined && minutes === undefined && seconds === undefined) return undefined
+  const ms = (Number(hours ?? 0) * 3600 + Number(minutes ?? 0) * 60 + Number(seconds ?? 0)) * 1000
+  return Number.isFinite(ms) && ms > 0 ? ms : undefined
+}
+
+/**
+ * Delay upstream asked the caller to wait before retrying, when it stated one
+ * in relative terms (`retry in 41.2s`, `reset after 2h3m4s`, `resets in 45m`,
+ * `"retryDelay": "41s"`).
+ * @param error - the failure.
+ * @returns the delay in milliseconds, or undefined when unstated.
+ */
+function retryAfterMsFromError(error: unknown): number | undefined {
+  const message = error instanceof Error ? error.message : String(error)
+  const quoted = /"retryDelay"\s*:\s*"([^"]+)"/i.exec(message)?.[1]
+  if (quoted !== undefined) {
+    const ms = parseDurationMs(quoted)
+    if (ms !== undefined) return ms
+  }
+  const relative = /(?:retry|resets?)\s+(?:after|in)\s+((?:\d+(?:\.\d+)?[hms])+)/i.exec(message)?.[1]
+  return relative === undefined ? undefined : parseDurationMs(relative)
+}
+
+/**
+ * Reset time an error reports, as an ISO timestamp. A stated absolute reset
+ * wins; a relative delay is converted to `now + delay`.
+ * @param error - the failure.
+ * @returns the ISO reset timestamp, or undefined when unstated.
+ */
+function resetTimeFromError(error: unknown): string | undefined {
+  const message = error instanceof Error ? error.message : String(error)
+  const absolute = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/.exec(message)?.[0]
+  if (absolute !== undefined) return absolute
+  const delayMs = retryAfterMsFromError(error)
+  return delayMs === undefined ? undefined : new Date(Date.now() + delayMs).toISOString()
+}
+
 function messageIds(messages: readonly RequestMessage[]): string[] {
   return messages.map(m => m.id ?? '')
 }
 
-/** Read a non-empty string field. */
-function nonEmpty(value: unknown): string | undefined {
-  return typeof value === 'string' && value.length > 0 ? value : undefined
-}
-
-/**
- * Extract the structured `(serverName, toolName)` an agent claimed in one
- * permission request: top-level `mcpServerName`/`mcpToolName` or `_meta`.
- * `title` and `rawInput` are deliberately not consulted.
- */
-function structuredToolMeta(toolCall: AcpPermissionRequest['toolCall']): { serverName?: string; toolName?: string } {
-  const meta: AcpToolCallMeta | undefined = toolCall?._meta
-  const serverName = nonEmpty(toolCall?.mcpServerName) ?? nonEmpty(meta?.mcpServerName) ?? nonEmpty(meta?.serverName) ?? nonEmpty(meta?.server)
-  const toolName = nonEmpty(toolCall?.mcpToolName) ?? nonEmpty(meta?.mcpToolName) ?? nonEmpty(meta?.toolName) ?? nonEmpty(meta?.tool)
-  return {
-    ...(serverName !== undefined ? { serverName } : {}),
-    ...(toolName !== undefined ? { toolName } : {}),
-  }
-}
-
-/**
- * Record the structured metadata of one agent-reported tool-call update.
- * The first report establishes the identity; later updates merge only the
- * fields actually present, so a status-only `tool_call_update` never wipes an
- * established `server`/`tool`/`kind`. A later field that contradicts the
- * established identity keeps the original value and marks the record
- * anomalous — the permission gate refuses every further request for that call.
- * @returns 'created' | 'merged' | 'conflict', or undefined for ignored updates.
- */
-function recordReportedToolCall(conv: Conversation, update: AcpSessionUpdate): 'created' | 'merged' | 'conflict' | undefined {
-  if (update.sessionUpdate !== 'tool_call' && update.sessionUpdate !== 'tool_call_update') return
-  if (typeof update.toolCallId !== 'string' || update.toolCallId.length === 0) return
-  const meta: AcpToolCallMeta | undefined = update._meta
-  const serverName = nonEmpty(update.mcpServerName) ?? nonEmpty(meta?.mcpServerName) ?? nonEmpty(meta?.serverName) ?? nonEmpty(meta?.server)
-  const toolName = nonEmpty(update.mcpToolName) ?? nonEmpty(meta?.mcpToolName) ?? nonEmpty(meta?.toolName) ?? nonEmpty(meta?.tool)
-  const kind = typeof update.kind === 'string' ? update.kind : undefined
-  const existing = conv.reportedToolCalls.get(update.toolCallId)
-  const merged: ReportedToolCall = existing === undefined ? {} : { ...existing }
-  let conflict = false
-  if (kind !== undefined) {
-    if (merged.kind !== undefined && merged.kind !== kind) conflict = true
-    else merged.kind = kind
-  }
-  if (serverName !== undefined) {
-    if (merged.serverName !== undefined && merged.serverName !== serverName) conflict = true
-    else merged.serverName = serverName
-  }
-  if (toolName !== undefined) {
-    if (merged.toolName !== undefined && merged.toolName !== toolName) conflict = true
-    else merged.toolName = toolName
-  }
-  if (conflict) merged.conflict = true
-  conv.reportedToolCalls.set(update.toolCallId, merged)
-  if (conflict) return 'conflict'
-  return existing === undefined ? 'created' : 'merged'
-}
-
-/** Whether `rawInput` carries no arguments at all (MCP server loading probes). */
-function isEmptyInput(rawInput: unknown): boolean {
-  if (rawInput === undefined || rawInput === null) return true
-  if (typeof rawInput === 'string') return rawInput.trim().length === 0
-  if (Array.isArray(rawInput)) return rawInput.length === 0
-  if (typeof rawInput === 'object') return Object.keys(rawInput).length === 0
-  return false
-}
-
-/**
- * Diff active tools against the session's known tool set and render a compact
- * `<harness_tool_update>` block for newly added, modified, restored, or disabled tools.
- * @param conv - conversation tool state (`advertisedToolNames` and `knownTools`).
- * @param tools - active tools for the current step.
- * @returns `<harness_tool_update>` text block, or `''` when unchanged.
- */
-export function consumeToolDelta(
-  conv: { readonly advertisedToolNames: ReadonlySet<string>; readonly knownTools: Map<string, string> },
-  tools: readonly BridgeTool[],
-): string {
-  const lines: string[] = []
-  const active = new Set<string>()
-  for (const tool of tools) {
-    active.add(tool.name)
-    const hash = digest(tool)
-    if (conv.knownTools.get(tool.name) === hash) continue
-    conv.knownTools.set(tool.name, hash)
-    if (conv.advertisedToolNames.has(tool.name)) {
-      lines.push(`[tool restored: ${AGENT_TOOL_PREFIX}${tool.name}]`)
-    } else {
-      lines.push(`[tool available via ${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME} with {"name":"${tool.name}","arguments":{...}}]: ${JSON.stringify({ name: tool.name, description: tool.description, parameters: tool.inputSchema })}`)
-    }
-  }
-  for (const name of [...conv.knownTools.keys()]) {
-    if (!active.has(name)) {
-      conv.knownTools.delete(name)
-      lines.push(`[tool disabled: ${name}]`)
-    }
-  }
-  return lines.length > 0 ? `<harness_tool_update>\n${lines.join('\n')}\n</harness_tool_update>` : ''
-}
-
-/** Byte ceiling keeping advertised MCP tool schemas below agy's ~1,500B lazy cutoff. */
-export const MAX_EAGER_BRIDGE_TOOL_BYTES = 1_350
-
-function shortenText(text: string, maxChars: number): string {
-  const clean = text.replace(/\s+/gu, ' ').trim()
-  if (clean.length <= maxChars) return clean
-  const sentenceEnd = clean.indexOf('. ')
-  if (sentenceEnd >= 32 && sentenceEnd + 1 <= maxChars) return clean.slice(0, sentenceEnd + 1)
-  return `${clean.slice(0, Math.max(1, maxChars - 1)).trimEnd()}…`
-}
-
-function compactSchemaNode(value: unknown, maxDescChars: number): unknown {
-  if (Array.isArray(value)) return value.map(item => compactSchemaNode(item, maxDescChars))
-  if (value === null || typeof value !== 'object') return value
-  const record = value as Record<string, unknown>
-  const out: Record<string, unknown> = {}
-  for (const [key, entry] of Object.entries(record)) {
-    if (key === 'description' && typeof entry === 'string') {
-      if (maxDescChars > 0) out[key] = shortenText(entry, maxDescChars)
-      continue
-    }
-    if (key === 'properties' && entry !== null && typeof entry === 'object' && !Array.isArray(entry)) {
-      const props: Record<string, unknown> = {}
-      for (const [propKey, propVal] of Object.entries(entry as Record<string, unknown>)) {
-        props[propKey] = compactSchemaNode(propVal, maxDescChars)
-      }
-      out[key] = props
-      continue
-    }
-    out[key] = compactSchemaNode(entry, maxDescChars)
-  }
-  return out
-}
-
-/**
- * Keep each MCP-advertised tool schema under `agy`'s eager size threshold while
- * preserving every parameter name, type, required list, and enum constraint.
- * Full prose instructions remain in DSH's system prompt.
- * @param tool - raw bridge tool descriptor.
- * @returns compacted descriptor when oversized, otherwise the original descriptor.
- */
-export function compactBridgeTool(tool: BridgeTool): BridgeTool {
-  if (Buffer.byteLength(JSON.stringify(tool), 'utf8') <= MAX_EAGER_BRIDGE_TOOL_BYTES) return tool
-  const pass1: BridgeTool = {
-    name: tool.name,
-    description: shortenText(tool.description, 220),
-    inputSchema: compactSchemaNode(tool.inputSchema, 90) as Record<string, unknown>,
-  }
-  if (Buffer.byteLength(JSON.stringify(pass1), 'utf8') <= MAX_EAGER_BRIDGE_TOOL_BYTES) return pass1
-  return {
-    name: tool.name,
-    description: shortenText(tool.description, 140),
-    inputSchema: compactSchemaNode(tool.inputSchema, 0) as Record<string, unknown>,
-  }
-}
-
-function toBridgeTools(tools: readonly ToolSchema[] | undefined): BridgeTool[] {
-  return (tools ?? []).filter(t => t.deferLoading !== true).map(t => compactBridgeTool({
-    name: t.name,
-    description: t.description,
-    inputSchema: t.parameters.type === undefined ? { type: 'object', ...t.parameters } : t.parameters,
-  }))
-}
-
-function turnSettled(turn: AcpTurn): Promise<void> {
+function turnSettled(turn: AcpTurn, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
   return (async () => {
-    while (turn.events.size > 0 || !turn.finished) {
+    while ((turn.events.size > 0 || !turn.finished) && Date.now() < deadline) {
       const head = turn.events.peek()
       if (head?.kind === 'done' || head?.kind === 'error') return
       await delay(100)
@@ -1179,14 +2321,14 @@ function turnSettled(turn: AcpTurn): Promise<void> {
 export function mapError(error: unknown): Error {
   if (error instanceof LlmError) return error
   const message = error instanceof Error ? error.message : String(error)
-  if (error instanceof JsonRpcClosedError) return new LlmError(`Antigravity ACP link closed: ${message}`, 'TRANSPORT', { cause: error })
+  if (error instanceof JsonRpcClosedError) return new LlmError(labeled('TRANSPORT', `Antigravity ACP link closed: ${message}`), 'TRANSPORT', { cause: error })
   if (/authentication required|not logged in|unauthenticated|sign in/i.test(message)) {
-    return new LlmError(`Antigravity requires sign-in: run \`agy\` once in a terminal (${message})`, 'AUTH', { cause: error })
+    return new LlmError(labeled('AUTH', message), 'AUTH', { cause: error })
   }
-  if (/quota|resource.?exhausted|limit reached|exceeded your/i.test(message)) return new LlmError(message, 'QUOTA', { cause: error })
-  if (/rate.?limit|429|too many requests|overloaded|capacity/i.test(message)) return new LlmError(message, 'RATE_LIMIT', { cause: error })
-  if (/context|too long|token limit|maximum.*tokens/i.test(message)) return new LlmError(message, 'CONTEXT_WINDOW_EXCEEDED', { cause: error })
-  if (/timeout|timed out|deadline/i.test(message)) return new LlmError(message, 'TIMEOUT', { cause: error })
-  if (error instanceof JsonRpcRemoteError) return new LlmError(`Antigravity: ${message}`, 'SERVER', { cause: error })
-  return new LlmError(message, 'TRANSPORT', { cause: error })
+  if (/quota|resource.?exhausted|limit reached|exceeded your/i.test(message)) return new LlmError(labeled('QUOTA', message), 'QUOTA', { cause: error })
+  if (/rate.?limit|429|too many requests|overloaded|capacity/i.test(message)) return new LlmError(labeled('RATE_LIMIT', message), 'RATE_LIMIT', { cause: error })
+  if (/context|too long|token limit|maximum.*tokens/i.test(message)) return new LlmError(labeled('CONTEXT_WINDOW_EXCEEDED', message), 'CONTEXT_WINDOW_EXCEEDED', { cause: error })
+  if (/timeout|timed out|deadline/i.test(message)) return new LlmError(labeled('TIMEOUT', message), 'TIMEOUT', { cause: error })
+  if (error instanceof JsonRpcRemoteError) return new LlmError(labeled('SERVER', `Antigravity: ${message}`), 'SERVER', { cause: error })
+  return new LlmError(labeled('TRANSPORT', message), 'TRANSPORT', { cause: error })
 }

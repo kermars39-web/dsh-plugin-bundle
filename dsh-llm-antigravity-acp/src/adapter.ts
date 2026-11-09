@@ -5,12 +5,26 @@
  * @module dsh-llm-antigravity-acp/adapter
  */
 
-import { LlmAdapter } from '@deepseek-ai/dsh-llm'
+import { LlmAdapter, resolveRetryPolicy } from '@deepseek-ai/dsh-llm'
 import type {
   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, ReasoningEffortId, ResolvedRetryPolicy, StreamChunk,
 } from '@deepseek-ai/dsh-llm'
 import { EFFORT_NAMES, nearestEffort } from './catalog.ts'
 import type { AntigravityRuntime } from './runtime.ts'
+
+/** Degraded-route failures are re-asked by the harness retry layer with the identical request. */
+const RETRYABLE_CODES = ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'DEGRADED_ROUTE']
+
+const ANTIGRAVITY_RETRY_POLICY: ResolvedRetryPolicy = resolveRetryPolicy({
+  mode: 'normal',
+  maxRetries: 4,
+  retryableCodes: [...RETRYABLE_CODES],
+  backoff: {
+    initialDelayMs: 2_000,
+    maxDelayMs: 15_000,
+    jitterRatio: 0.15,
+  },
+}, 'llm-antigravity-acp.retryPolicy')
 
 /** Antigravity primary-model adapter. */
 export class AntigravityAdapter extends LlmAdapter {
@@ -32,7 +46,7 @@ export class AntigravityAdapter extends LlmAdapter {
   }
 
   override providerRetryPolicy(_provider: string): ResolvedRetryPolicy | undefined {
-    return undefined
+    return ANTIGRAVITY_RETRY_POLICY
   }
 
   override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
@@ -64,6 +78,7 @@ export class AntigravityAdapter extends LlmAdapter {
         },
       } : {},
       systemPromptUpdate: 'in-history',
+      toolUpdate: 'in-history',
     })
   }
 

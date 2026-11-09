@@ -4,8 +4,20 @@
  * ACP runtime.
  * @module dsh-llm-antigravity-acp/adapter
  */
-import { LlmAdapter } from '@deepseek-ai/dsh-llm';
+import { LlmAdapter, resolveRetryPolicy } from '@deepseek-ai/dsh-llm';
 import { EFFORT_NAMES, nearestEffort } from "./catalog.js";
+/** Degraded-route failures are re-asked by the harness retry layer with the identical request. */
+const RETRYABLE_CODES = ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT', 'DEGRADED_ROUTE'];
+const ANTIGRAVITY_RETRY_POLICY = resolveRetryPolicy({
+    mode: 'normal',
+    maxRetries: 4,
+    retryableCodes: [...RETRYABLE_CODES],
+    backoff: {
+        initialDelayMs: 2_000,
+        maxDelayMs: 15_000,
+        jitterRatio: 0.15,
+    },
+}, 'llm-antigravity-acp.retryPolicy');
 /** Antigravity primary-model adapter. */
 export class AntigravityAdapter extends LlmAdapter {
     runtime;
@@ -26,7 +38,7 @@ export class AntigravityAdapter extends LlmAdapter {
         return { id: provider, name: this.displayName };
     }
     providerRetryPolicy(_provider) {
-        return undefined;
+        return ANTIGRAVITY_RETRY_POLICY;
     }
     listModels(provider) {
         return Promise.resolve(this.runtime.catalog.list().map(model => ({
@@ -56,6 +68,7 @@ export class AntigravityAdapter extends LlmAdapter {
                 },
             } : {},
             systemPromptUpdate: 'in-history',
+            toolUpdate: 'in-history',
         });
     }
     stream(options) {

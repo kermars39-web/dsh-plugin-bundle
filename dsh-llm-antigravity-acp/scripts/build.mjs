@@ -11,7 +11,7 @@
 //      profile — the parent chain of a linked plugin usually reaches it.
 // A checkout that carries the peer packages but no built `lib/types` fails the
 // compile instead of silently resolving another copy.
-import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync } from 'node:fs'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, relative, resolve } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -103,7 +103,16 @@ if (checkOnly) {
 rmSync(join(root, 'lib'), { recursive: true, force: true })
 const tsc = spawnSync(process.execPath, [tscBin, '-p', join(root, 'tsconfig.json')], { stdio: 'inherit' })
 if (tsc.status !== 0) process.exit(tsc.status ?? 1)
-copyFileSync(join(root, 'src', 'client.js'), join(root, 'lib', 'client.js'))
+// The browser half is the shared model-selection module followed by the
+// plugin's own client, composed into one bundle at build time. The module only
+// defines a factory (`createModelSelection`), so concatenation keeps it out of
+// any runtime require path while letting every ACP provider ship the same
+// selection UI verbatim instead of drifting copies.
+const modelSelectionSource = join(root, 'src', 'model-selection.js')
+const clientComposed = existsSync(modelSelectionSource)
+  ? `${readFileSync(modelSelectionSource, 'utf8')}\n${readFileSync(join(root, 'src', 'client.js'), 'utf8')}`
+  : readFileSync(join(root, 'src', 'client.js'), 'utf8')
+writeFileSync(join(root, 'lib', 'client.js'), `;(() => {\n${clientComposed}\n})();\n`)
 console.log('dsh-llm-antigravity-acp: built lib/')
 
 function isLink(path) {

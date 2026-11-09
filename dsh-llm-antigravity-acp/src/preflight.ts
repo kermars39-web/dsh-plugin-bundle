@@ -17,6 +17,10 @@ import { delimiter, isAbsolute, join } from 'node:path'
 export const BRIDGE_AGENT = 'dsh-bridge'
 /** Minimum official CLI version supporting `agy acp --process-per-session`. */
 export const MIN_AGY_VERSION: readonly [number, number, number] = [1, 4, 12]
+/** Default model display name pre-seeded into isolated `settings.json` files. */
+export const DEFAULT_SEEDED_MODEL = 'Gemini 4 Argon (High)'
+/** Default context-window label aligned with `~/.gemini/antigravity-cli/settings.json`. */
+export const DEFAULT_SEEDED_CONTEXT_WINDOW = '512K'
 /** Context window the official binary enforces without the unlock. */
 export const LOCKED_CONTEXT_WINDOW = 256_000
 /** Physical context window of the Gemini 4, Gemini 3.8, and Claude 5.5 families. */
@@ -32,7 +36,7 @@ export interface CommandOutput {
 }
 
 /** Runs one helper command to completion. */
-export type CommandRunner = (argv: readonly string[], timeoutMs: number) => Promise<CommandOutput>
+export type CommandRunner = (argv: readonly string[], timeoutMs: number, env?: NodeJS.ProcessEnv) => Promise<CommandOutput>
 
 /** Result of the context-unlock check. */
 export interface UnlockState {
@@ -54,7 +58,7 @@ export interface PreflightResult {
   unlock: UnlockState
 }
 
-/** Platform/environment overrides for executable discovery tests. */
+/** Platform and environment overrides for executable discovery tests. */
 export interface ResolveBinaryOptions {
   platform?: NodeJS.Platform
   env?: NodeJS.ProcessEnv
@@ -126,7 +130,7 @@ export function resolvePythonArgv(options: ResolveBinaryOptions = {}): string[] 
       const candidate = join(dir, name)
       try {
         if (statSync(candidate).size > 0) return [candidate]
-      } catch {
+      } catch (_missingPython) {
         // Candidate does not exist in this PATH entry.
       }
     }
@@ -169,12 +173,12 @@ export function defaultHome(): string {
 }
 
 /**
- * Seed or refresh the isolated `antigravity-oauth-token` file from the user's
- * default CLI home (`~/.gemini/antigravity-cli` or `~/.gemini/antigravity`)
+ * Seed or refresh the isolated `antigravity-oauth-token` file from the account's
+ * CLI home (`<userHome>/.gemini/antigravity-cli` or `<userHome>/.gemini/antigravity`)
  * whenever the host uses file-backed token storage (Windows / headless Linux)
  * or the user signed in again from a terminal.
  * @param home - isolated `--gemini-dir` root.
- * @param userHome - optional user home override for testing.
+ * @param userHome - user home owning the source token file.
  */
 export function syncOAuthToken(home: string, userHome: string = homedir()): void {
   const appData = join(home, 'agy')
@@ -190,7 +194,7 @@ export function syncOAuthToken(home: string, userHome: string = homedir()): void
       if (st.size > 0 && (newestSrc === undefined || st.mtimeMs > newestSrc.mtimeMs)) {
         newestSrc = { path: candidate, mtimeMs: st.mtimeMs }
       }
-    } catch {
+    } catch (_missingSrc) {
       // Source token file does not exist.
     }
   }
@@ -198,14 +202,14 @@ export function syncOAuthToken(home: string, userHome: string = homedir()): void
   try {
     const dstStat = statSync(dst)
     if (dstStat.size > 0 && dstStat.mtimeMs >= newestSrc.mtimeMs) return
-  } catch {
+  } catch (_missingDst) {
     // Destination token file does not exist yet.
   }
   mkdirSync(appData, { recursive: true })
   copyFileSync(newestSrc.path, dst)
   try {
     chmodSync(dst, 0o600)
-  } catch {
+  } catch (_advisoryMode) {
     // Mode bits are advisory on Windows.
   }
 }
@@ -213,7 +217,7 @@ export function syncOAuthToken(home: string, userHome: string = homedir()): void
 /**
  * Write the isolated Antigravity home: bridge agent and ACP settings.
  * @param home - absolute home directory used as `--gemini-dir`.
- * @param userHome - optional user home override for testing.
+ * @param userHome - optional user home override for file-backed token sync.
  * @returns the empty workspace directory used as every session's cwd.
  */
 export function prepareHome(home: string, userHome: string = homedir()): string {
@@ -232,14 +236,42 @@ export function prepareHome(home: string, userHome: string = homedir()): string 
     '',
   ].join('\n'))
   const appData = join(home, 'agy')
-  mkdirSync(appData, { recursive: true })
+  mkdirSync(join(appData, 'conversations'), { recursive: true })
+  mkdirSync(join(home, 'antigravity', 'conversations'), { recursive: true })
   syncOAuthToken(home, userHome)
-  const settingsPath = join(appData, 'settings.json')
-  const settings = readJson(settingsPath)
-  writeIfChanged(settingsPath, `${JSON.stringify({ ...settings, toolPermission: 'request-review', agentMode: '' }, null, 2)}\n`)
+  seedCliSettingsFile(join(appData, 'settings.json'))
+  const defaultCliAppData = join(home, 'antigravity-cli')
+  mkdirSync(defaultCliAppData, { recursive: true })
+  seedCliSettingsFile(join(defaultCliAppData, 'settings.json'))
   const workspace = join(home, 'workspace')
   mkdirSync(workspace, { recursive: true })
   return workspace
+}
+
+function seedCliSettingsFile(settingsPath: string): void {
+  const settings = readJson(settingsPath)
+  const hostCliSettings = readJson(join(homedir(), '.gemini', 'antigravity-cli', 'settings.json'))
+  const rawModel = typeof settings.model === 'string' ? settings.model.trim() : ''
+  const model = rawModel.length > 0 && rawModel !== 'Gemini 4 Argon (Medium)'
+    ? rawModel
+    : DEFAULT_SEEDED_MODEL
+  const contextWindow = typeof settings.contextWindow === 'string' && settings.contextWindow.trim().length > 0
+    ? settings.contextWindow
+    : DEFAULT_SEEDED_CONTEXT_WINDOW
+  const useG1Credits = typeof settings.useG1Credits === 'boolean'
+    ? settings.useG1Credits
+    : (typeof hostCliSettings.useG1Credits === 'boolean' ? hostCliSettings.useG1Credits : undefined)
+  writeIfChanged(
+    settingsPath,
+    `${JSON.stringify({
+      ...settings,
+      ...(useG1Credits !== undefined ? { useG1Credits } : {}),
+      contextWindow,
+      model,
+      toolPermission: 'request-review',
+      agentMode: '',
+    }, null, 2)}\n`,
+  )
 }
 
 /**
@@ -248,6 +280,7 @@ export function prepareHome(home: string, userHome: string = homedir()): string 
  * @param script - unlock script path.
  * @param apply - whether to patch a locked binary.
  * @param run - helper command runner.
+ * @param options - optional platform/env overrides for testing.
  * @returns the unlock state.
  */
 export async function checkUnlock(

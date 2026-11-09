@@ -39,7 +39,7 @@ export class AcpProcess {
      * @param timeoutMs - handshake deadline.
      */
     async start(timeoutMs) {
-        const child = this.options.spawn(this.options.argv, this.options.cwd);
+        const child = this.options.spawn(this.options.argv, this.options.cwd, this.options.env);
         this.child = child;
         const peer = new JsonRpcPeer(child.stdout, child.stdin, {
             onRequest: (method, params) => this.onRequest(method, params),
@@ -76,6 +76,23 @@ export class AcpProcess {
         const result = await this.link().request('session/new', params, { timeoutMs });
         this.listeners.set(result.sessionId, listener);
         return result;
+    }
+    /**
+     * Resume an existing durable ACP session (`<sessionId>.db`) with fresh MCP server endpoints.
+     * Attaches `listener` after `session/load` settles so any historical replay chunks emitted
+     * during load are ignored.
+     * @param params - `session/load` parameters (`sessionId`, `cwd`, `mcpServers`, `_meta`).
+     * @param listener - observer bound to the loaded session id.
+     * @param timeoutMs - load deadline.
+     * @returns the loaded session result.
+     */
+    async loadSession(params, listener, timeoutMs) {
+        const result = await this.link().request('session/load', params, { timeoutMs });
+        const sessionId = typeof result?.sessionId === 'string' && result.sessionId.length > 0
+            ? result.sessionId
+            : String(params['sessionId'] ?? '');
+        this.listeners.set(sessionId, listener);
+        return { ...result, sessionId };
     }
     /**
      * Select one configuration option value.

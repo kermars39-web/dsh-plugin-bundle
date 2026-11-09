@@ -12,6 +12,7 @@
  */
 import { LlmError, ToolCallId } from '@deepseek-ai/dsh-llm';
 import { AGENT_TOOL_PREFIX, CALL_TOOL_NAME } from "./history.js";
+import { labeled } from "./labels.js";
 import { AsyncQueue, deferred } from "./util.js";
 export { CALL_TOOL_NAME };
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
@@ -74,6 +75,34 @@ export const CALL_TOOL = {
         required: ['name'],
     },
 };
+/**
+ * Failure that ends one step as degraded, so the harness request-retry layer
+ * asks for the identical request again about a second later and the plugin
+ * re-answers inside the same ACP session.
+ * @returns the tagged failure with the harness retry hint.
+ */
+export function degradedRouteError() {
+    return new LlmError(labeled('DEGRADED_ROUTE', '上游把这次回答分到了降级线路，已在原会话重新生成。'), 'DEGRADED_ROUTE', { providerRetryAfterMs: 1_000 });
+}
+/**
+ * Failure that ends a step whose degraded tool call never recovered within the
+ * automatic re-answer budget; the tool was never executed.
+ * @returns the terminal failure.
+ */
+export function degradedExhaustedError() {
+    return new LlmError(labeled('DEGRADED_ROUTE_EXHAUSTED', '上游连续把这次回答分到了降级线路；本次工具调用没有执行，请稍后重试。'), 'DEGRADED_ROUTE_EXHAUSTED');
+}
+/**
+ * Whether a failure asks for (or reports the end of) an automatic re-answer.
+ * Neither is upstream quota: such failures must never cool an account down,
+ * fail a step over to another account, or reset the ACP session.
+ * @param error - the failure.
+ * @returns true for {@link degradedRouteError} and {@link degradedExhaustedError}.
+ */
+export function isReanswerFailure(error) {
+    const code = error?.code;
+    return code === 'DEGRADED_ROUTE' || code === 'DEGRADED_ROUTE_EXHAUSTED';
+}
 /** One running ACP prompt turn. */
 export class AcpTurn {
     turnTag;
@@ -106,6 +135,8 @@ export class AcpTurn {
         cachedWriteTokens: 0,
         thoughtTokens: 0,
     };
+    /** Usage read from the session DB for the step that is ending, not yet reported. */
+    stagedUsage;
     nextCall = 0;
     /** @param turnTag - unique per-turn hex tag used in synthesized call ids (`agy_<turnTag>_<n>`). */
     constructor(turnTag) {
@@ -122,6 +153,52 @@ export class AcpTurn {
         this.emittedRaw.cachedReadTokens += batch.usage.cachedReadTokens ?? 0;
         this.emittedRaw.cachedWriteTokens += batch.usage.cachedWriteTokens ?? 0;
         this.emittedRaw.thoughtTokens += batch.usage.thoughtTokens ?? 0;
+    }
+    /**
+     * Hold usage a read consumed for the step that is ending, so it is reported exactly
+     * once: the degradation gate and the end-of-turn check read the same batch the step
+     * reports, and a second read would find nothing left.
+     * @param sample - usage of the model steps read so far in this step.
+     */
+    stageStepUsage(sample) {
+        const staged = this.stagedUsage;
+        if (staged === undefined) {
+            this.stagedUsage = { calls: sample.calls, usage: { ...sample.usage }, steps: [...sample.steps] };
+            return;
+        }
+        staged.calls += sample.calls;
+        staged.steps.push(...sample.steps);
+        staged.usage.inputTokens = (staged.usage.inputTokens ?? 0) + (sample.usage.inputTokens ?? 0);
+        staged.usage.outputTokens = (staged.usage.outputTokens ?? 0) + (sample.usage.outputTokens ?? 0);
+        staged.usage.cachedReadTokens = (staged.usage.cachedReadTokens ?? 0) + (sample.usage.cachedReadTokens ?? 0);
+        staged.usage.cachedWriteTokens = (staged.usage.cachedWriteTokens ?? 0) + (sample.usage.cachedWriteTokens ?? 0);
+        staged.usage.thoughtTokens = (staged.usage.thoughtTokens ?? 0) + (sample.usage.thoughtTokens ?? 0);
+        staged.usage.totalTokens = (staged.usage.totalTokens ?? 0) + (sample.usage.totalTokens ?? 0);
+    }
+    /**
+     * Take the usage staged for the step that is ending.
+     * @returns the staged sample and clears it.
+     */
+    takeStepUsage() {
+        const staged = this.stagedUsage;
+        this.stagedUsage = undefined;
+        return staged;
+    }
+    /**
+     * Whether an earlier read already staged usage for the step that is ending: the
+     * tool gate and the end-of-turn check read the generation this step reports.
+     */
+    hasStagedUsage() {
+        return this.stagedUsage !== undefined;
+    }
+    /**
+     * Drop the usage staged for a step that will never be delivered, counting it as
+     * already emitted so a later fallback subtraction never reports it twice.
+     */
+    discardStagedUsage() {
+        const staged = this.takeStepUsage();
+        if (staged !== undefined)
+            this.recordStepBatch(staged);
     }
     /**
      * Register one agent tool call.
@@ -263,11 +340,24 @@ export async function* pumpStep(turn, host, signal) {
         open.text += text;
         yield type === 'text' ? { type: 'text-delta', index: open.index, text } : { type: 'reasoning-delta', index: open.index, text };
     };
+    let sawStepThought = false;
+    let heldZeroThoughtText = '';
+    let emittedVisibleText = false;
+    const flushHeldText = function* () {
+        if (heldZeroThoughtText.length === 0)
+            return;
+        const text = heldZeroThoughtText;
+        heldZeroThoughtText = '';
+        turn.produced = true;
+        emittedVisibleText = true;
+        yield* append('text', text);
+    };
     for (;;) {
         const ready = await turn.events.wait(signal);
         if (!ready) {
             host.cancel();
             turn.abandon('The harness cancelled this request.');
+            heldZeroThoughtText = '';
             yield* close();
             yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'Request aborted', code: 'ABORTED' } } };
             return;
@@ -275,20 +365,35 @@ export async function* pumpStep(turn, host, signal) {
         if (turn.events.peek()?.kind !== 'text') {
             const held = turn.recoverNoticeHold();
             if (held.length > 0) {
-                turn.produced = true;
-                yield* append('text', held);
+                if (host.holdZeroThoughtText === true && !sawStepThought && !emittedVisibleText) {
+                    heldZeroThoughtText += held;
+                }
+                else {
+                    turn.produced = true;
+                    emittedVisibleText = true;
+                    yield* append('text', held);
+                }
             }
         }
         const event = turn.events.shift();
         switch (event.kind) {
             case 'thought':
+                sawStepThought = true;
+                yield* flushHeldText();
                 yield* append('reasoning', event.text);
                 break;
             case 'text':
-                turn.produced = true;
-                yield* append('text', event.text);
+                if (host.holdZeroThoughtText === true && !sawStepThought && !emittedVisibleText) {
+                    heldZeroThoughtText += event.text;
+                }
+                else {
+                    turn.produced = true;
+                    emittedVisibleText = true;
+                    yield* append('text', event.text);
+                }
                 break;
             case 'park': {
+                yield* flushHeldText();
                 turn.produced = true;
                 yield* close();
                 const batch = [event.call];
@@ -307,7 +412,7 @@ export async function* pumpStep(turn, host, signal) {
                     yield { type: 'tool-call-delta', index: blockIndex, id: call.id, name: call.name, argumentsDelta: call.argumentsJson };
                     yield { type: 'block-end', index: blockIndex, block: { type: 'tool-call', id: call.id, name: call.name, arguments: call.argumentsJson } };
                 }
-                const stepSample = await host.consumeStepUsage?.();
+                const stepSample = await host.consumeStepUsage?.({ final: false });
                 if (stepSample !== undefined) {
                     const usage = toTokenUsage(stepSample.usage, stepSample.calls);
                     if (usage !== undefined)
@@ -320,15 +425,29 @@ export async function* pumpStep(turn, host, signal) {
             case 'done': {
                 const stop = event.result.stopReason;
                 if (stop === 'max_tokens' && turn.continuations < host.maxContinuations) {
+                    yield* flushHeldText();
                     turn.continuations++;
                     void host.continuePrompt().then(result => turn.events.push({ kind: 'done', result }), (error) => turn.events.push({ kind: 'error', error: error instanceof Error ? error : new Error(String(error)) }));
                     break;
                 }
+                if (stop === 'end_turn' && host.verifyEndTurn !== undefined) {
+                    const hadZeroThoughtHold = !sawStepThought && heldZeroThoughtText.length > 0 && !emittedVisibleText;
+                    if (await host.verifyEndTurn(hadZeroThoughtHold) === 'degrade') {
+                        // The degraded answer is discarded: held text never reaches the
+                        // transcript, and the step fails so the harness re-asks the same
+                        // request. Reasoning already streamed stays.
+                        heldZeroThoughtText = '';
+                        turn.finished = true;
+                        yield* close();
+                        throw degradedRouteError();
+                    }
+                }
+                yield* flushHeldText();
                 turn.finished = true;
                 yield* close();
                 const calls = turn.toolSteps + turn.continuations + 1;
                 host.recordUsage(event.result.usage, calls);
-                const finalSample = await host.consumeStepUsage?.();
+                const finalSample = await host.consumeStepUsage?.({ final: true });
                 let usage;
                 if (finalSample !== undefined) {
                     usage = toTokenUsage(finalSample.usage, finalSample.calls);
@@ -357,7 +476,7 @@ export async function* pumpStep(turn, host, signal) {
                 if (usage !== undefined)
                     yield { type: 'usage', usage };
                 if (stop === 'end_turn' && !turn.produced) {
-                    throw new LlmError('Antigravity ended the turn without visible output', 'EMPTY_RESPONSE');
+                    throw new LlmError(labeled('EMPTY_RESPONSE', 'Antigravity ended the turn without visible output'), 'EMPTY_RESPONSE');
                 }
                 switch (stop) {
                     case 'end_turn':
@@ -370,7 +489,7 @@ export async function* pumpStep(turn, host, signal) {
                         yield { type: 'finish', reason: { kind: 'aborted', failure: { message: 'Antigravity cancelled the turn', code: 'ABORTED' } } };
                         return;
                     case 'refusal':
-                        yield { type: 'finish', reason: { kind: 'error', failure: { message: 'Antigravity refused the request', code: 'REFUSAL' } } };
+                        yield { type: 'finish', reason: { kind: 'error', failure: { message: labeled('REFUSAL', 'Antigravity refused the request'), code: 'REFUSAL' } } };
                         return;
                     default:
                         yield { type: 'finish', reason: { kind: 'error', failure: { message: `Antigravity stopped: ${stop}`, code: 'PROVIDER_ERROR' } } };

@@ -30,14 +30,33 @@ const HISTORY_OPEN = '<dsh_history>\n';
 const HISTORY_CLOSE = '\n</dsh_history>\n\n';
 /** Upper bound of the omission notice, reserved before history is selected. */
 const OMISSION_NOTICE_RESERVE_BYTES = 128;
+/** User-role message source kinds injected by DSH context providers rather than typed by a human. */
+const BACKGROUND_USER_SOURCES = new Set([
+    'runtime-context',
+    'skill-catalog',
+    'tool-manager-catalog',
+    'time-context',
+    'agent-instructions',
+]);
 /**
  * Live input for a rebuild whose trailing messages are all tool results (for
  * example right after compaction in the middle of a tool loop), so the agent
  * receives a meaningful instruction instead of an empty prompt.
  */
 export const EMPTY_INPUT_CONTINUATION = 'Continue the task from the latest tool results above.';
+function messageSourceKind(message) {
+    const source = message.source;
+    return typeof source?.kind === 'string' ? source.kind : undefined;
+}
+function stripSystemReminderEnvelope(raw) {
+    const trimmed = raw.trim();
+    const match = /^<system-reminder>\s*([\s\S]*?)\s*<\/system-reminder>$/i.exec(trimmed);
+    return match?.[1] !== undefined ? match[1].trim() : trimmed;
+}
 /**
- * Split leading system messages (and the one-shot `system` field) from history.
+ * Split leading system messages, the one-shot `system` field, and initial
+ * `agent-instructions` (`AGENTS.md`) injected before the first assistant turn
+ * into the elevated system prompt.
  * @param options - the model request.
  * @returns the combined system text and the remaining messages.
  */
@@ -52,7 +71,25 @@ export function splitSystem(options) {
         parts.push(textOf(message.content));
         index++;
     }
-    return { system: parts.filter(Boolean).join('\n\n'), messages: options.messages.slice(index) };
+    const rules = [];
+    const remaining = [];
+    let sawAssistant = false;
+    for (let i = index; i < options.messages.length; i++) {
+        const message = options.messages[i];
+        if (message.role === 'assistant')
+            sawAssistant = true;
+        if (!sawAssistant && message.role === 'user' && messageSourceKind(message) === 'agent-instructions') {
+            const cleaned = stripSystemReminderEnvelope(textOf(message.content));
+            if (cleaned.length > 0)
+                rules.push(cleaned);
+            continue;
+        }
+        remaining.push(message);
+    }
+    if (rules.length > 0) {
+        parts.push(`<user_rules>\n${rules.join('\n\n')}\n</user_rules>`);
+    }
+    return { system: parts.filter(Boolean).join('\n\n'), messages: remaining };
 }
 /**
  * Join the text blocks of one message.
@@ -63,17 +100,64 @@ export function textOf(content) {
     return content.filter((b) => b.type === 'text').map(b => b.text).join('');
 }
 /**
+ * Render full untruncated descriptions and parameter docs for active tools
+ * whose MCP declarations exceed `maxEagerBytes` and are compacted on the wire.
+ * @param tools - active tool schemas for the session.
+ * @param maxEagerBytes - byte ceiling above which MCP schemas are compacted.
+ * @returns markdown specification block body, or `''` when all tools fit intact.
+ */
+export function renderFullToolContracts(tools, maxEagerBytes) {
+    if (tools === undefined || tools.length === 0)
+        return '';
+    const sections = [];
+    for (const tool of tools) {
+        if (tool.deferLoading === true)
+            continue;
+        const inputSchema = tool.parameters.type === undefined ? { type: 'object', ...tool.parameters } : tool.parameters;
+        const wireBytes = Buffer.byteLength(JSON.stringify({ name: tool.name, description: tool.description, inputSchema }), 'utf8');
+        if (wireBytes <= maxEagerBytes)
+            continue;
+        const lines = [`### ${AGENT_TOOL_PREFIX}${tool.name}`];
+        const desc = tool.description.trim();
+        if (desc.length > 0)
+            lines.push(desc);
+        const rawProps = inputSchema.properties;
+        if (rawProps !== null && typeof rawProps === 'object' && !Array.isArray(rawProps)) {
+            const paramLines = [];
+            for (const [propName, propVal] of Object.entries(rawProps)) {
+                const propDesc = propVal !== null && typeof propVal === 'object'
+                    ? propVal.description
+                    : undefined;
+                if (typeof propDesc === 'string' && propDesc.trim().length > 0) {
+                    paramLines.push(`- \`${propName}\`: ${propDesc.trim()}`);
+                }
+            }
+            if (paramLines.length > 0)
+                lines.push(`Parameters:\n${paramLines.join('\n')}`);
+        }
+        sections.push(lines.join('\n\n'));
+    }
+    return sections.join('\n\n');
+}
+/**
  * The bridge instructions appended to the agent's system prompt.
  * @param system - the DSH system prompt.
+ * @param toolContracts - optional full prose contracts for compacted MCP tools.
  * @returns the complete appended system text.
  */
-export function bridgeSystemPrompt(system) {
+export function bridgeSystemPrompt(system, toolContracts) {
     const preamble = [
         'You are the primary model of a DeepSeek Harness (DSH) session. The harness owns the conversation, the tools, and their permissions.',
         `Every harness tool is available to you under the prefix \`${AGENT_TOOL_PREFIX}\`: a tool named \`X\` in the instructions below is the tool \`${AGENT_TOOL_PREFIX}X\`. If \`${AGENT_TOOL_PREFIX}X\` is absent from your direct tool declarations, invoke it via \`${AGENT_TOOL_PREFIX}${CALL_TOOL_NAME}\` with \`{"name":"X","arguments":{...}}\`. Use only these tools; pass arguments exactly as their schemas define.`,
         'When the first user message contains a <dsh_history> block, it reproduces the earlier part of this conversation; continue from the newest input after it without repeating completed actions.',
     ].join('\n');
-    return system.length > 0 ? `${preamble}\n\n${system}` : preamble;
+    const parts = [preamble];
+    if (system.length > 0)
+        parts.push(system);
+    if (toolContracts !== undefined && toolContracts.length > 0) {
+        parts.push(`<harness_tool_contracts>\nFull specifications for harness tools whose MCP schemas were compacted for eager loading:\n\n${toolContracts}\n</harness_tool_contracts>`);
+    }
+    return parts.join('\n\n');
 }
 /**
  * Render a list of messages as transcript text.
@@ -201,12 +285,6 @@ export async function replayPrompt(history, input, resolveImage, maxHistoryBytes
     blocks.push(...inputBlocks);
     return blocks;
 }
-/**
- * Render the newest messages that fit `budget`, announcing any omitted prefix.
- * @param history - messages before the trailing input.
- * @param budget - byte budget for the transcript body.
- * @returns the complete `<dsh_history>` block, or an empty string without history.
- */
 function historyTranscript(history, budget) {
     const parts = [];
     let used = 0;
@@ -241,12 +319,6 @@ function historyTranscript(history, budget) {
         return '';
     return `${HISTORY_OPEN}${parts.join('\n\n')}${HISTORY_CLOSE}`;
 }
-/**
- * Render one oversized tool result with its head kept inside `budget`.
- * @param message - the newest tool message.
- * @param budget - byte budget for its rendered transcript.
- * @returns the truncated transcript, or undefined when even the markup does not fit.
- */
 function truncatedToolTranscript(message, budget) {
     const marker = '\n[tool result truncated to fit the context replay budget]';
     let limit = budget - utf8Bytes(marker);
@@ -272,22 +344,54 @@ function headWithinBytes(text, maxBytes) {
         end--;
     return bytes.subarray(0, end).toString('utf8');
 }
+function isPureToolUpdateDeveloperMessage(message) {
+    return message.role === 'developer'
+        && message.content.length > 0
+        && message.content.every(b => b.type === 'tool-addition' || b.type === 'tool-removal');
+}
+function isBackgroundInputMessage(message) {
+    if (message.role !== 'user')
+        return true;
+    const kind = messageSourceKind(message);
+    return kind !== undefined && BACKGROUND_USER_SOURCES.has(kind);
+}
 /**
- * Convert new input messages (user, developer notices) into live prompt blocks.
+ * Convert new input messages (user, developer notices) into live prompt blocks,
+ * placing background context catalogs before foreground human input and separating
+ * consecutive message groups with blank lines.
  * @param input - messages that arrived after the session's known history.
  * @param resolveImage - image byte resolver.
+ * @param options - optional rendering controls.
  * @returns prompt blocks.
  */
-export async function inputPrompt(input, resolveImage) {
+export async function inputPrompt(input, resolveImage, options) {
+    const filtered = options?.omitPureToolUpdates === true
+        ? input.filter(m => !isPureToolUpdateDeveloperMessage(m))
+        : input;
+    const background = [];
+    const foreground = [];
+    for (const message of filtered) {
+        if (isBackgroundInputMessage(message))
+            background.push(message);
+        else
+            foreground.push(message);
+    }
+    const ordered = [...background, ...foreground];
     const blocks = [];
-    for (const message of input) {
-        if (message.role === 'user')
-            blocks.push(...await promptBlocks(message.content, resolveImage));
+    for (const message of ordered) {
+        let group;
+        if (message.role === 'user') {
+            group = await promptBlocks(message.content, resolveImage);
+        }
         else {
             const text = renderTranscript([message]);
-            if (text.length > 0)
-                blocks.push({ type: 'text', text });
+            group = text.length > 0 ? [{ type: 'text', text }] : [];
         }
+        if (group.length === 0)
+            continue;
+        if (blocks.length > 0)
+            blocks.push({ type: 'text', text: '\n\n' });
+        blocks.push(...group);
     }
     if (blocks.length === 0)
         blocks.push({ type: 'text', text: 'Continue.' });

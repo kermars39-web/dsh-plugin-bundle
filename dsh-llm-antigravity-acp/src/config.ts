@@ -13,6 +13,37 @@ export const EFFORTS = ['low', 'medium', 'high'] as const
 /** One Antigravity reasoning effort. */
 export type Effort = typeof EFFORTS[number]
 
+/** One declared account of the pool. */
+export interface AccountProfile {
+  /** Directory key under the pool root. Empty asks the pool to assign one and save it back. */
+  id: string
+  /** Optional remark shown in the settings card. Empty shows as untitled. */
+  displayName: string
+  /** Absolute account root; empty uses `<plugin home>/accounts/<id>`. */
+  home: string
+  /** Disabled accounts keep their files and login but receive no traffic. */
+  enabled: boolean
+  /** Extra environment for this account's CLI processes, such as a dedicated `HTTPS_PROXY`. */
+  env: Record<string, string>
+  /** Context-window override in tokens. `0` follows the provider default. */
+  contextWindow: number
+  /**
+   * Keep this machine's own login, `$HOME`, and keychain. Such an entry is
+   * always enabled and its id defaults to `default`.
+   */
+  system?: boolean
+  /**
+   * Fine-grained subset of the provider's visible families. Empty inherits the
+   * provider allowlist; the effective set is always
+   * `provider ∩ account`, so this can only narrow what the provider offers.
+   */
+  visibleModels: string[]
+  /** Scheduling priority (`1..999`, default `1`); smaller values take precedence (`1` beats `2`). */
+  priority?: number
+  /** Scheduling weight (`1..100`, default `1`); distributes load proportionally within the same priority tier. */
+  weight?: number
+}
+
 /** Validated plugin configuration. */
 export interface Config {
   /** Provider route id shown in the model picker. */
@@ -23,6 +54,22 @@ export interface Config {
   command: string
   /** Isolated Antigravity home for ACP sessions; empty uses `$DSH_HOME/cache/antigravity-acp`. */
   home: string
+  /**
+   * Every account of the pool, the machine account included as the entry with
+   * `system: true`. The list is the only truth: no entry means no machine
+   * account.
+   */
+  accounts: AccountProfile[]
+  /**
+   * Shape version of the stored configuration, migrated at plugin load. `0`
+   * means the stored file predates the account list and still needs migration.
+   */
+  configVersion: Volatile<number>
+  /**
+   * Model families offered in the picker, as a subset of what the CLI
+   * advertises. Empty offers every advertised family.
+   */
+  visibleModels: string[]
   /** Declared context window in tokens; 0 selects 1,048,576 for an unlocked binary and 256,000 otherwise. */
   contextWindow: Volatile<number>
   /** Effort applied when a request carries none. */
@@ -37,6 +84,8 @@ export interface Config {
   idleSessionTtlMs: number
   /** Window that groups parallel tool calls into one DSH step. */
   parkSettleMs: number
+  /** Settle delay in ms after a cold-session `session/set_config_option` switch before sending `session/prompt`. */
+  coldSwitchSettleMs: number
   /** SSE keepalive interval for parked tool calls. */
   keepAliveMs: number
   /** Delay in ms before a parked tool call returns a still-running relay notice to refresh cache TTL before agy's 180s MCP deadline. */
@@ -61,12 +110,27 @@ export const Config: z<Config> = z.object({
   command: z.string().default(''),
   home: z.string().default(''),
   contextWindow: maybeVolatile(z.number().step(1).min(0).default(0)),
+  accounts: maybeVolatile(z.array(z.object({
+    id: z.string().default(''),
+    displayName: z.string().default(''),
+    home: z.string().default(''),
+    enabled: z.boolean().default(true),
+    env: z.dict(z.string()).default({}),
+    contextWindow: z.number().step(1).min(0).max(1_048_576).default(0),
+    system: z.boolean().default(false),
+    visibleModels: z.array(z.string()).default([]),
+    priority: z.number().step(1).min(1).max(999).default(1),
+    weight: z.number().step(1).min(1).max(100).default(1),
+  })).default([])),
+  configVersion: maybeVolatile(z.number().step(1).min(0).default(0)),
+  visibleModels: maybeVolatile(z.array(z.string()).default([])),
   defaultEffort: maybeVolatile(z.union(EFFORTS).default('high')),
   autoPatch: z.boolean().default(true),
   patchScript: z.string().default(''),
   maxLiveSessions: z.number().step(1).min(1).max(64).default(16),
   idleSessionTtlMs: z.number().step(1).min(10_000).default(30 * 60_000),
   parkSettleMs: z.number().step(1).min(0).max(5_000).default(250),
+  coldSwitchSettleMs: z.number().step(1).min(0).max(2_000).default(80),
   keepAliveMs: z.number().step(1).min(1_000).default(15_000),
   relayAfterMs: z.number().step(1).min(5_000).max(165_000).default(85_000),
   longDecodeContinuations: maybeVolatile(z.number().step(1).min(0).max(16).default(3)),
