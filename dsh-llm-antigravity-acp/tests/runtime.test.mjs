@@ -11,7 +11,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { AntigravityRuntime, compactBridgeTool, DEFAULT_RELAY_AFTER_MS, MAX_EAGER_BRIDGE_TOOL_BYTES } from '../lib/runtime.js'
 import { AntigravityAdapter } from '../lib/adapter.js'
 import { Config } from '../lib/config.js'
-import { toTokenUsage } from '../lib/conversation.js'
+import { classifyAgentNotice, toTokenUsage } from '../lib/conversation.js'
 import { EMPTY_INPUT_CONTINUATION, LOCKED_REPLAY_BUDGET_BYTES } from '../lib/history.js'
 import { assertSupportedAgyVersion, checkUnlock, prepareHome, resolveAgyBinary, resolvePythonArgv, syncOAuthToken } from '../lib/preflight.js'
 import { AntigravityRemote, INVOCATIONS } from '../lib/remote.js'
@@ -309,6 +309,146 @@ test('agy output-limit continuation notices never reach the model output', async
   assert.doesNotMatch(textOf(chunks), /output token limit/)
   assert.doesNotMatch(textOf(chunks), /Retries remaining/)
   assert.match(textOf(chunks), /^echo:/)
+})
+
+test('classifyAgentNotice intercepts network-issue and high-traffic warnings without dropping quoted prose', () => {
+  assert.deepEqual(
+    classifyAgentNotice('\n⚠ There was a network issue connecting to the server, please try again.\n'),
+    { kind: 'error', code: 'TRANSPORT', message: 'There was a network issue connecting to the server, please try again.' },
+  )
+  assert.deepEqual(
+    classifyAgentNotice('⚠ Error: There was a network issue connecting to the server, please try again.'),
+    { kind: 'error', code: 'TRANSPORT', message: 'There was a network issue connecting to the server, please try again.' },
+  )
+  assert.deepEqual(classifyAgentNotice('\n⚠ '), { kind: 'hold' })
+  assert.deepEqual(classifyAgentNotice('⚠ API error (attempt '), { kind: 'hold' })
+  assert.deepEqual(classifyAgentNotice('There was a network issue connecting'), { kind: 'hold' })
+  assert.deepEqual(
+    classifyAgentNotice('There was a network issue connecting to the server, please try again.'),
+    { kind: 'hold' },
+  )
+  assert.deepEqual(
+    classifyAgentNotice('There was a network issue connecting to the server, please try again', true),
+    { kind: 'error', code: 'TRANSPORT', message: 'There was a network issue connecting to the server, please try again.' },
+  )
+  assert.deepEqual(
+    classifyAgentNotice('There was a network issue connecting to the server, please try again. This warning comes from agy.'),
+    { kind: 'emit' },
+  )
+  assert.deepEqual(
+    classifyAgentNotice('\n⚠ Our servers are experiencing high traffic right now, please try again in a minute.\n'),
+    { kind: 'error', code: 'RATE_LIMIT', message: 'Our servers are experiencing high traffic right now, please try again in a minute.' },
+  )
+})
+
+test('agy network-issue text warnings fail as retryable TRANSPORT with zero leaked text and rebuild cleanly on retry', async () => {
+  const plan = [
+    { chunks: ['\n⚠ ', 'There was a network issue ', 'connecting to the server, please try again', '.\n'] },
+    { chunks: ['There was a network issue connecting to the server, ', 'please try again'] },
+    { chunks: ['There was a network issue connecting to the server, please try again.', ' This sentence is quoted in prose.'] },
+    { chunks: ['\n⚠ There was a network issue connecting to the server, please try again.\n', 'recovered answer'] },
+    { tool: { name: 'bash', args: { command: 'pwd' } }, afterTool: { chunks: ['\n⚠ There was a network issue connecting to the server, please try again.\n'] } },
+    { text: 'after-tool retry ok' },
+  ]
+  const { adapter, prompts } = makeRuntime({ env: { FAKE_AGY_PLAN: JSON.stringify(plan) } })
+  const base = { provider: 'antigravity', model: 'gemini-4-argon', sessionId: 'S11c' }
+
+  const leaked1 = []
+  await assert.rejects(
+    async () => {
+      for await (const chunk of adapter.stream({ ...base, messages: [sys, user('u1', 'ping')] })) leaked1.push(chunk)
+    },
+    error => error?.code === 'TRANSPORT' && /\[连接中断\] There was a network issue/.test(error.message),
+  )
+  assert.deepEqual(leaked1, [])
+
+  const leaked2 = []
+  await assert.rejects(
+    async () => {
+      for await (const chunk of adapter.stream({ ...base, messages: [sys, user('u1', 'ping')] })) leaked2.push(chunk)
+    },
+    error => error?.code === 'TRANSPORT',
+  )
+  assert.deepEqual(leaked2, [])
+  assert.notEqual(prompts()[1].session, prompts()[0].session, 'a failed network turn discards the poisoned ACP session')
+
+  const quoted = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'explain it')] }))
+  assert.equal(
+    textOf(quoted),
+    'There was a network issue connecting to the server, please try again. This sentence is quoted in prose.',
+  )
+
+  const recovered = await collect(adapter.stream({ ...base, messages: [sys, user('u1', 'explain it'), assistantFrom('a1', quoted), user('u2', 'retry inline')] }))
+  assert.equal(textOf(recovered), 'recovered answer')
+
+  const step1 = await collect(adapter.stream({
+    ...base,
+    sessionId: 'S11d',
+    tools: [bash],
+    messages: [sys, user('u1', 'run pwd')],
+  }))
+  assert.equal(finishOf(step1).reason.kind, 'tool-calls')
+  const call = callsOf(step1)[0]
+  const step2Messages = [sys, user('u1', 'run pwd'), assistantFrom('a1', step1), tool('t1', call.id, '/workspace')]
+
+  const leakedStep2 = []
+  await assert.rejects(
+    async () => {
+      for await (const chunk of adapter.stream({ ...base, sessionId: 'S11d', tools: [bash], messages: step2Messages })) leakedStep2.push(chunk)
+    },
+    error => error?.code === 'TRANSPORT',
+  )
+  assert.deepEqual(leakedStep2, [])
+
+  const retriedStep2 = await collect(adapter.stream({ ...base, sessionId: 'S11d', tools: [bash], messages: step2Messages }))
+  assert.equal(finishOf(retriedStep2).reason.kind, 'stop')
+  assert.equal(textOf(retriedStep2), 'after-tool retry ok')
+})
+
+test('agy high-traffic text warnings fail as RATE_LIMIT and fail over to a healthy account without leaking text', async () => {
+  const rootA = mkdtempSync(join(tmpdir(), 'agy-traffic-a-'))
+  const rootB = mkdtempSync(join(tmpdir(), 'agy-traffic-b-'))
+  const homeA = join(rootA, 'home')
+  const { adapter, runtime } = makeRuntime({
+    config: {
+      accounts: [
+        { id: 'a', displayName: 'A', home: rootA, enabled: true, env: {}, contextWindow: 0, system: false, visibleModels: [], priority: 1, weight: 1 },
+        { id: 'b', displayName: 'B', home: rootB, enabled: true, env: {}, contextWindow: 0, system: false, visibleModels: [], priority: 2, weight: 1 },
+      ],
+    },
+    host: {
+      spawnAcp: (argv, cwd, env) => {
+        const childEnv = { ...process.env, ...env }
+        if (env?.HOME === homeA) {
+          childEnv.FAKE_AGY_PLAN = JSON.stringify([
+            { chunks: ['\n⚠ Our servers are experiencing high traffic right now, please try again in a minute.\n'] },
+          ])
+        }
+        const child = spawn(process.execPath, [argv[0], ...argv.slice(1)], { cwd, env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] })
+        let stderr = ''
+        child.stderr.on('data', d => { stderr += d })
+        return {
+          stdin: child.stdin,
+          stdout: child.stdout,
+          exited: new Promise(resolve => child.on('exit', (code, signal) => resolve({ code, signal }))),
+          terminate: () => child.kill(),
+          stderrTail: () => stderr,
+        }
+      },
+    },
+  })
+
+  const chunks = await collect(adapter.stream({
+    provider: 'antigravity',
+    model: 'gemini-3.8-flash',
+    sessionId: 'S11e',
+    messages: [sys, user('u1', 'hello failover')],
+  }))
+  assert.equal(finishOf(chunks).reason.kind, 'stop')
+  assert.doesNotMatch(textOf(chunks), /high traffic/)
+  assert.match(textOf(chunks), /^echo:gemini-3\.8-flash:high:hello failover$/)
+  assert.equal(runtime.status().lastAccount, 'b')
+  assert.equal(runtime.status().accounts.find(row => row.id === 'a').cooldowns.length, 1)
 })
 
 test('cache reads stay disjoint from the uncached input count', () => {

@@ -291,7 +291,16 @@ async function runPlanStage(s, stage) {
     if (part.tool !== undefined) {
       const result = await runToolCall(s, part.tool.name, part.tool.args ?? {})
       if (s.cancelled) return { stopReason: 'cancelled' }
-      if (part.text === undefined) text += `RESULT(${part.tool.name})=${result}`
+      if (part.text === undefined && !Array.isArray(part.chunks)) text += `RESULT(${part.tool.name})=${result}`
+    }
+    if (Array.isArray(part.chunks)) {
+      if (text.length > 0) {
+        update(s.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
+        text = ''
+      }
+      for (const chunk of part.chunks) {
+        update(s.id, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: chunk } })
+      }
     }
     if (typeof part.text === 'string') text += part.text
   }

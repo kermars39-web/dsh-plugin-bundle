@@ -16,14 +16,40 @@ import { labeled } from "./labels.js";
 import { AsyncQueue, deferred } from "./util.js";
 export { CALL_TOOL_NAME };
 /** Agent-side transport retry notice streamed as message text, e.g. `⚠ API error (attempt 1): …`. */
-const AGENT_RETRY_NOTICE = /^\s*⚠\s*API error \(attempt \d+\)/;
+const AGENT_RETRY_NOTICE = /^\s*⚠\s*(?:Error:\s*)?API error \(attempt \d+\)/i;
+/** Prefix of `AGENT_RETRY_NOTICE` while its opening words arrive across chunks. */
+const AGENT_RETRY_PREFIX = /^\s*⚠\s*(?:e(?:r(?:r(?:o(?:r:?)?)?)?)?\s*)?(?:a(?:p(?:i(?:\s+e(?:r(?:r(?:o(?:r(?:\s*\((?:a(?:t(?:t(?:e(?:m(?:p(?:t(?:\s*\d*)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?)?$/i;
+/** Lone warning prefix (`⚠` or `⚠ Error:`) before the notice body arrives. */
+const WARNING_PREFIX = /^\s*⚠(?:\s*e(?:r(?:r(?:o(?:r:?)?)?)?)?)?\s*$/i;
 /** First sentence of the notice agy inserts when one generation hits its own output cap. */
 const OUTPUT_LIMIT_HEAD = 'your previous response was cut off because it exceeded the output token limit';
 /** Second sentence of that same notice. */
 const OUTPUT_LIMIT_TAIL = 'please continue from where you left off, keeping your response shorter';
+/** Terminal step error agy streams as message text when upstream connection attempts fail. */
+const NETWORK_ISSUE_MESSAGE = 'There was a network issue connecting to the server, please try again.';
+const NETWORK_ISSUE_HEAD = 'there was a network issue connecting to the server, please try again';
+/** Terminal step error agy streams as message text when upstream rejects the turn for high traffic. */
+const HIGH_TRAFFIC_MESSAGE = 'Our servers are experiencing high traffic right now, please try again in a minute.';
+const HIGH_TRAFFIC_HEAD = 'our servers are experiencing high traffic right now, please try again in a minute';
 /** Collapse agy's warning mark and line breaks so the notice can be recognized across chunks. */
 function noticeText(raw) {
     return raw.replace(/⚠/g, ' ').replace(/\bError:/gi, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+function matchTerminalNotice(raw, text, head, code, message, final) {
+    const full = `${head}.`;
+    const marked = raw.includes('⚠');
+    if (text === full || (marked && text.startsWith(`${full} `))) {
+        // Without `⚠`, hold until `final` so a model reply that quotes the sentence
+        // and continues explaining it is emitted intact.
+        return marked || final ? { kind: 'error', code, message } : { kind: 'hold' };
+    }
+    if (text === head) {
+        return final ? { kind: 'error', code, message } : { kind: 'hold' };
+    }
+    if (!final && full.startsWith(text)) {
+        return { kind: 'hold' };
+    }
+    return undefined;
 }
 /**
  * Classify text against agy's output-cap continuation notice.
@@ -49,6 +75,34 @@ export function classifyOutputLimitNotice(raw) {
     if ('retries remaining:'.startsWith(text) && text.startsWith('retries'))
         return 'hold';
     return 'emit';
+}
+/**
+ * Classify buffered `agent_message_chunk` text against agy's non-model notices.
+ * @param raw - buffered message text since the last emitted or dropped chunk.
+ * @param final - true when the message stream ended or switched away from text.
+ * @returns how the turn should handle `raw`.
+ */
+export function classifyAgentNotice(raw, final = false) {
+    const outputLimit = classifyOutputLimitNotice(raw);
+    if (outputLimit === 'drop')
+        return { kind: 'drop' };
+    if (outputLimit === 'hold')
+        return final ? { kind: 'emit' } : { kind: 'hold' };
+    if (AGENT_RETRY_NOTICE.test(raw))
+        return { kind: 'drop' };
+    if (!final && (WARNING_PREFIX.test(raw) || AGENT_RETRY_PREFIX.test(raw.trim()))) {
+        return { kind: 'hold' };
+    }
+    const text = noticeText(raw);
+    if (text.length === 0)
+        return { kind: 'emit' };
+    const network = matchTerminalNotice(raw, text, NETWORK_ISSUE_HEAD, 'TRANSPORT', NETWORK_ISSUE_MESSAGE, final);
+    if (network !== undefined)
+        return network;
+    const traffic = matchTerminalNotice(raw, text, HIGH_TRAFFIC_HEAD, 'RATE_LIMIT', HIGH_TRAFFIC_MESSAGE, final);
+    if (traffic !== undefined)
+        return traffic;
+    return { kind: 'emit' };
 }
 /** Tool the agent calls to keep waiting on a relayed DSH tool result. */
 export const AWAIT_TOOL_NAME = 'dsh_await_result';
@@ -123,7 +177,9 @@ export class AcpTurn {
     produced = false;
     /** Agent-side transport retry notices dropped from the output. */
     retryNotices = 0;
-    /** Message text that may still be the start of agy's output-cap notice. */
+    /** Terminal transport or overload failure reported as message text by agy. */
+    agentFailure;
+    /** Message text that may still be the start of an agy status notice. */
     noticeHold = '';
     /** Model calls inside this turn whose usage was already emitted per-step from SQLite. */
     emittedCalls = 0;
@@ -207,6 +263,10 @@ export class AcpTurn {
      * @returns the parked call.
      */
     park(name, args) {
+        const held = this.recoverNoticeHold();
+        if (held.length > 0 && !this.relaying)
+            this.events.push({ kind: 'text', text: held });
+        this.agentFailure = undefined;
         const call = {
             id: ToolCallId(`agy_${this.turnTag}_${++this.nextCall}`),
             name,
@@ -236,27 +296,37 @@ export class AcpTurn {
         }
     }
     /**
-     * Keep a message chunk out of the chat while it is only agy's output-cap notice.
+     * Keep a message chunk out of the chat while it matches or may still complete an agy status notice.
      * @param text - one streamed message chunk.
      */
     consumeMessage(text) {
+        if (this.noticeHold.length === 0 && this.agentFailure !== undefined && text.trim().length === 0) {
+            return;
+        }
         const combined = this.noticeHold + text;
-        const kind = classifyOutputLimitNotice(combined);
-        if (kind === 'hold') {
+        const verdict = classifyAgentNotice(combined, false);
+        if (verdict.kind === 'hold') {
             this.noticeHold = combined;
             return;
         }
         this.noticeHold = '';
-        if (kind === 'drop' || AGENT_RETRY_NOTICE.test(combined)) {
+        if (verdict.kind === 'drop') {
             this.retryNotices++;
             return;
         }
+        if (verdict.kind === 'error') {
+            this.retryNotices++;
+            this.agentFailure = new LlmError(labeled(verdict.code, verdict.message), verdict.code);
+            return;
+        }
+        if (combined.trim().length > 0)
+            this.agentFailure = undefined;
         if (!this.relaying)
             this.events.push({ kind: 'text', text: combined });
     }
     /**
      * Release a held prefix once the message stream moves on.
-     * A finished output-cap notice is counted and discarded; anything else is returned for emission.
+     * A finished agy notice is counted and discarded (or recorded on `agentFailure`); anything else is returned for emission.
      * @returns model text to show, or an empty string.
      */
     recoverNoticeHold() {
@@ -264,10 +334,21 @@ export class AcpTurn {
             return '';
         const held = this.noticeHold;
         this.noticeHold = '';
-        if (classifyOutputLimitNotice(held) === 'drop') {
+        const verdict = classifyAgentNotice(held, true);
+        if (verdict.kind === 'drop') {
             this.retryNotices++;
             return '';
         }
+        if (verdict.kind === 'error') {
+            this.retryNotices++;
+            this.agentFailure = new LlmError(labeled(verdict.code, verdict.message), verdict.code);
+            return '';
+        }
+        if (this.agentFailure !== undefined && WARNING_PREFIX.test(held)) {
+            return '';
+        }
+        if (held.trim().length > 0)
+            this.agentFailure = undefined;
         return this.relaying ? '' : held;
     }
     /**
@@ -423,6 +504,12 @@ export async function* pumpStep(turn, host, signal) {
                 return;
             }
             case 'done': {
+                if (turn.agentFailure !== undefined) {
+                    heldZeroThoughtText = '';
+                    turn.finished = true;
+                    yield* close();
+                    throw turn.agentFailure;
+                }
                 const stop = event.result.stopReason;
                 if (stop === 'max_tokens' && turn.continuations < host.maxContinuations) {
                     yield* flushHeldText();
