@@ -41,6 +41,12 @@ flowchart LR
 | 降级线路自动重答 | `Gemini 4 Argon` 的每次生成都会留下 `gen_metadata` 账单，插件据此判断上游是否把这次回答分到了降级线路。判定点有两个：回答结束时，以及工具调用执行前。判定为降级后，这次回答整体丢弃，本步以 `DEGRADED_ROUTE` 失败；DSH 的模型请求重试层约 1 秒后重跑同一步，插件在原 ACP 会话里发出重答指令；首轮刚被拦下、会话还没有完成过一轮时，插件换一个新会话重发原问题。同一请求最多自动重答 2 次，用满后文字回答照常交付并标记可能降级，工具调用则以 `DEGRADED_ROUTE_EXHAUSTED` 停止、不执行任何工具。整个过程不让账号冷却、不换号 |
 | 设置行 | 上下文窗口、默认思考、超长续写在设置页使用统一行式控件：左侧标签、右侧当前值与 `›`，点开在同一张卡片内展开候选值（当前项打勾），选中即通过 `configure` 生效 |
 
+## 显示别名
+
+在 **设置 → Antigravity → 显示别名 → 编辑别名** 中，可修改模型菜单的分组名称及各模型的显示名称，点击「保存别名」写入本插件配置。清空单项恢复默认名称；「重置别名」清空整组草稿，保存后生效，「取消」不写入。暂时未出现在目录中的已保存模型别名仍会保留，避免目录刷新丢失设置。
+
+别名仅影响展示：`provider` 和模型 ID、账号调度、额度归属及实际 ACP 请求均不变。名称限单行、最多 80 字符；保存失败会显示错误并保留草稿，不把未保存的别名伪装成已生效。只读配置不能保存别名。
+
 ## 多账号
 
 同一个插件可以挂多个 Antigravity 账号，额度用尽时自动换号继续，对话不中断。全程只调官方 `agy` 二进制，不提取、不重放 OAuth token，也没有任何转发层。
@@ -97,6 +103,8 @@ pnpm dsh plugin --profile web add ./plugins/dsh-llm-antigravity-acp
 | 字段 | 默认值 | 说明 |
 |---|---|---|
 | `provider` | `antigravity` | 路由 id |
+| `displayName` | `Antigravity` | 模型菜单的分组显示别名，空值恢复默认（可即时修改） |
+| `modelDisplayNames` | `{}` | 原始模型 ID → 显示别名映射，仅影响展示（可即时修改） |
 | `command` | 空 | `agy` 绝对路径；空则在 macOS / Linux 查找 `~/.local/bin/agy` 与 `PATH`，在 Windows 查找 `%LOCALAPPDATA%\agy\bin\agy.exe`、`~/.local/bin/agy.exe` 与 `PATH` |
 | `home` | 空 | 隔离目录；空则 `$DSH_HOME/cache/antigravity-acp`。账号池也建在它下面 |
 | `accounts` | `[]` | 账号列表，本机账号是其中 `system: true` 的条目。每条包含 `id`（限 `A-Z a-z 0-9 . _ -`，空则由插件分配并写回）、`displayName`（备注）、`home`（空则用 `<home>/accounts/<id>`）、`enabled`、`env`（可为该账号绑定独立代理等环境变量）、`visibleModels`（该账号可服务的模型，空则跟随供应商级）、`contextWindow`（该账号的窗口收窄值，`0` 跟随全局）、`priority` 与 `weight`（调度优先级与权重） |

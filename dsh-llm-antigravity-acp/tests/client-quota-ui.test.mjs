@@ -745,6 +745,52 @@ function recordingService(windowValue = 0, decodeValue = 3) {
   return { service, patches }
 }
 
+test('SettingsCard edits, cancels, resets and saves display aliases without losing offline models or failed drafts', async () => {
+  let status = { state: 'ready', displayName: 'Antigravity', modelDisplayNames: { offline: 'Saved offline' }, availableModels: [{ id: 'gemini-4-argon', name: 'Gemini 4 Argon', enabled: true }], accounts: [] }
+  let reject = false, resolveSave
+  const patches = []
+  const { registered, mount } = loadClientPlugin({ remoteService: {
+    status: async () => status,
+    configure: async (patch) => {
+      patches.push(JSON.parse(JSON.stringify(patch)))
+      if (reject) throw new Error('profile refused')
+      if (resolveSave === null) await new Promise(resolve => { resolveSave = resolve })
+      status = { ...status, ...patch }
+      return status
+    },
+  } })
+  const slot = registered.get('settings.section')
+  const view = mount(slot.Component, slot.meta.inject())
+  const button = (text) => findOne(view.tree, n => n.tag === 'button' && textOf(n) === text)
+  const field = (label) => findOne(view.tree, n => n.tag === 'input' && n.props['aria-label'] === label)
+  await flush()
+  button('编辑别名').props.onClick(); await flush()
+  field('分组别名').props.onChange({ target: { value: 'My Google' } })
+  field('模型别名 gemini-4-argon').props.onChange({ target: { value: 'My Reasoner' } }); await flush()
+  button('取消').props.onClick(); await flush()
+  assert.equal(patches.length, 0)
+  button('编辑别名').props.onClick(); await flush()
+  assert.equal(field('分组别名').props.value, 'Antigravity')
+  field('分组别名').props.onChange({ target: { value: 'My Google' } })
+  field('模型别名 gemini-4-argon').props.onChange({ target: { value: 'My Reasoner' } }); await flush()
+  reject = true; button('保存别名').props.onClick(); await flush()
+  assert.match(textOf(view.tree), /profile refused/)
+  assert.equal(field('模型别名 gemini-4-argon').props.value, 'My Reasoner')
+  reject = false; resolveSave = null
+  const save = button('保存别名'); save.props.onClick(); save.props.onClick(); await flush()
+  assert.equal(patches.length, 2, 'one failed request plus one in-flight request, no double submit')
+  assert.ok(findOne(view.tree, n => n.tag === 'fieldset' && n.props.disabled === true))
+  resolveSave(); await flush()
+  assert.equal(patches[1].modelDisplayNames.offline, 'Saved offline')
+  assert.equal(patches[1].modelDisplayNames['gemini-4-argon'], 'My Reasoner')
+  button('编辑别名').props.onClick(); await flush()
+  button('重置别名').props.onClick(); await flush()
+  assert.equal(field('分组别名').props.value, '')
+  button('保存别名').props.onClick(); await flush()
+  assert.deepEqual(patches[2], { displayName: '', modelDisplayNames: {} })
+  view.unmount()
+})
+
 test('SettingsCard renders live settings as value rows that apply the chosen option', async () => {
   const { service, patches } = recordingService()
   const { registered, mount } = loadClientPlugin({ language: 'zh-CN', remoteService: service })
@@ -1464,7 +1510,7 @@ test('an account block narrows the provider catalog and writes its own subset', 
   const view = mount(slot.Component, slot.meta.inject())
   await flush()
   // The account row renders its own block inside the editor; open it first.
-  const edit = findAll(view.tree, (node) => node.tag === 'button' && textOf(node).includes('编辑'))[0]
+  const edit = findAll(view.tree, (node) => node.tag === 'button' && textOf(node) === '编辑')[0]
   if (edit !== undefined) {
     edit.props.onClick()
     await flush()

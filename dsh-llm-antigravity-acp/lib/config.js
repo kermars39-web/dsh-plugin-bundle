@@ -14,7 +14,8 @@ function maybeVolatile(schema) {
 /** Configuration schema. */
 export const Config = z.object({
     provider: z.string().default('antigravity'),
-    displayName: z.string().default('Antigravity'),
+    displayName: maybeVolatile(z.string().default('Antigravity')),
+    modelDisplayNames: maybeVolatile(z.dict(z.string()).default({})),
     command: z.string().default(''),
     home: z.string().default(''),
     contextWindow: maybeVolatile(z.number().step(1).min(0).default(0)),

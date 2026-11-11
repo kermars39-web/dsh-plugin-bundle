@@ -162,6 +162,28 @@ export function parseConfigureRequest(value) {
         throw new TypeError('Invalid antigravity configure request');
     const record = value;
     const out = {};
+    const displayName = (name) => {
+        if (typeof name !== 'string' || name.trim().length > 80 || /[\u0000-\u001f\u007f]/.test(name)) {
+            throw new TypeError('Invalid antigravity display name: use a single line of at most 80 characters');
+        }
+        return name.trim();
+    };
+    if (record.displayName !== undefined)
+        out.displayName = displayName(record.displayName);
+    if (record.modelDisplayNames !== undefined) {
+        const names = record.modelDisplayNames;
+        if (names === null || typeof names !== 'object' || Array.isArray(names) || Object.keys(names).length > 500) {
+            throw new TypeError('Invalid antigravity modelDisplayNames');
+        }
+        out.modelDisplayNames = Object.create(null);
+        for (const [id, value] of Object.entries(names)) {
+            if (!id.trim() || id.length > 200)
+                throw new TypeError('Invalid antigravity model display name id');
+            const name = displayName(value);
+            if (name)
+                out.modelDisplayNames[id] = name;
+        }
+    }
     if (record.accounts !== undefined) {
         if (!Array.isArray(record.accounts))
             throw new TypeError('Invalid antigravity configure request.accounts');
@@ -373,10 +395,21 @@ export class AntigravityRemote extends TypertRemoteService {
      */
     async configure(request) {
         const patch = parseConfigureRequest(request);
-        const status = this.options.runtime.configure(patch);
         const settings = this.ctx.get('settings');
+        // Alias edits must not look saved when the profile refused persistence.
+        // Store these presentation-only fields before applying their live override.
+        const aliases = {
+            ...patch.displayName !== undefined ? { displayName: patch.displayName } : {},
+            ...patch.modelDisplayNames !== undefined ? { modelDisplayNames: patch.modelDisplayNames } : {},
+        };
+        if (Object.keys(aliases).length > 0) {
+            if (settings?.writable !== true || typeof settings.update !== 'function')
+                throw new Error('Display aliases require writable profile settings');
+            await settings.update(this.options.settingsNs, { ...aliases });
+        }
+        const status = this.options.runtime.configure(patch);
         if (settings?.writable === true && typeof settings.update === 'function') {
-            const stored = { ...patch };
+            const { displayName: _displayName, modelDisplayNames: _modelDisplayNames, ...stored } = patch;
             if (patch.accounts !== undefined) {
                 // The machine account travels inside the list: storing the reported
                 // rows keeps it and leaves its default label unremark'd. A request
@@ -384,7 +417,8 @@ export class AntigravityRemote extends TypertRemoteService {
                 stored.accounts = storedAccounts(status.accounts);
             }
             try {
-                await settings.update(this.options.settingsNs, { ...stored });
+                if (Object.keys(stored).length > 0)
+                    await settings.update(this.options.settingsNs, { ...stored });
             }
             catch (_persistSkipped) {
                 // Ephemeral or overlay-mounted entries may not exist in the profile patch; in-memory override still applies.

@@ -189,6 +189,19 @@ export class AntigravityRuntime {
             return nearestEffort(requested, offered);
         return this.catalog.fixedEffort(model) ?? requested;
     }
+    /** Current provider alias; never used as a route id. */
+    displayName() {
+        return (this.overrides.displayName ?? current(this.host.config.displayName) ?? '').trim() || 'Antigravity';
+    }
+    /** Saved aliases include temporarily undiscovered models. */
+    modelDisplayNames() {
+        return { ...(this.overrides.modelDisplayNames ?? current(this.host.config.modelDisplayNames) ?? {}) };
+    }
+    /** Resolve a presentation label without mutating the canonical catalog. */
+    modelDisplayName(id, fallback) {
+        const names = this.overrides.modelDisplayNames ?? current(this.host.config.modelDisplayNames) ?? {};
+        return Object.hasOwn(names, id) && names[id]?.trim() ? names[id].trim() : fallback;
+    }
     /** Default effort. */
     defaultEffort() {
         return this.overrides.defaultEffort ?? current(this.host.config.defaultEffort);
@@ -400,6 +413,8 @@ export class AntigravityRuntime {
         const preflight = this.primaryPreflight();
         const sessionHealth = this.collectSessionHealth();
         return {
+            displayName: this.displayName(),
+            modelDisplayNames: this.modelDisplayNames(),
             state: this.overallState(),
             ...this.lastError !== undefined ? { error: this.lastError } : {},
             ...preflight !== undefined ? {

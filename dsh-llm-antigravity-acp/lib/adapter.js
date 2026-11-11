@@ -35,7 +35,7 @@ export class AntigravityAdapter extends LlmAdapter {
         this.imageInput = imageInput;
     }
     providerInfo(provider) {
-        return { id: provider, name: this.displayName };
+        return { id: provider, name: this.runtime.displayName?.() ?? this.displayName };
     }
     providerRetryPolicy(_provider) {
         return ANTIGRAVITY_RETRY_POLICY;
@@ -44,7 +44,7 @@ export class AntigravityAdapter extends LlmAdapter {
         return Promise.resolve(this.runtime.catalog.list().map(model => ({
             provider,
             id: model.id,
-            name: model.name,
+            name: this.runtime.modelDisplayName?.(model.id, model.name) ?? model.name,
             description: 'Antigravity via the official ACP server',
             inputModalities: this.imageInput() ? ['text', 'image'] : ['text'],
         })));
@@ -56,7 +56,7 @@ export class AntigravityAdapter extends LlmAdapter {
         return Promise.resolve({
             provider,
             id: model,
-            name: entry?.name ?? model,
+            name: this.runtime.modelDisplayName?.(model, entry?.name ?? model) ?? entry?.name ?? model,
             inputModalities: this.imageInput() ? ['text', 'image'] : ['text'],
             context: { contextWindow: this.runtime.contextWindowFor(model) },
             // A fixed-effort family (gpt-oss-120b-medium) has no selector; its

@@ -183,11 +183,11 @@ export function apply(ctx, config) {
     });
     const fiberEntry = ctx.fiber.entry;
     const settingsNs = fiberEntry?.options?.id ?? name;
-    const adapter = new AntigravityAdapter(runtime, config.displayName, () => attachments() !== undefined);
+    const adapter = new AntigravityAdapter(runtime, runtime.displayName(), () => attachments() !== undefined);
     ctx.llm.registerConfigurableProviders([
         {
             provider: config.provider,
-            displayName: config.displayName,
+            displayName: runtime.displayName(),
             settingsNs,
             settingsPath: [],
             nativeAuth: { env: [], oauth: true },

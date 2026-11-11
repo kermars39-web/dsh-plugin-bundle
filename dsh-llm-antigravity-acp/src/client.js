@@ -1917,6 +1917,60 @@ window.__ModuleLoader__.load({
       } catch { /* storage may be unavailable; the in-memory copy still serves */ }
     }
 
+    /** Presentation-only aliases; the canonical model ids remain visible. */
+    function DisplayAliases(props) {
+      const [editing, setEditing] = React.useState(false)
+      const [providerName, setProviderName] = React.useState('')
+      const [names, setNames] = React.useState({})
+      const [busy, setBusy] = React.useState(false)
+      const [error, setError] = React.useState(null)
+      const saving = React.useRef(false)
+      const begin = () => {
+        setProviderName(props.status.displayName || 'Antigravity')
+        setNames({ ...(props.status.modelDisplayNames || {}) })
+        setError(null)
+        setEditing(true)
+      }
+      const models = props.status.availableModels || props.status.models || []
+      const ids = models.map((model) => model.id)
+      const rows = models.concat(Object.keys(names).filter((id) => ids.indexOf(id) < 0).map((id) => ({ id, name: id })))
+      const save = async () => {
+        if (saving.current) return
+        saving.current = true
+        setBusy(true)
+        setError(null)
+        try {
+          const status = await props.client.configure({ displayName: providerName, modelDisplayNames: names })
+          props.onStatus(status)
+          setEditing(false)
+        } catch (e) {
+          setError(e instanceof Error ? e.message : String(e))
+        } finally {
+          saving.current = false
+          setBusy(false)
+        }
+      }
+      return h('div', { className: 'dsh-agy-card', style: { padding: 14 } },
+        h('div', { className: 'dsh-agy-stack', style: { justifyContent: 'space-between' } },
+          h('strong', null, t('Display aliases', '显示别名')),
+          !editing ? h('button', { type: 'button', className: 'dsh-agy-btn', onClick: begin }, t('Edit aliases', '编辑别名')) : null),
+        editing ? h('fieldset', { disabled: busy, style: { border: 0, padding: 0, margin: '12px 0 0', minWidth: 0 } },
+          h('p', { className: 'dsh-agy-muted', style: { margin: '0 0 12px' } }, t('Only display names change. Routing and quota still use the original ids. Clear an alias to restore its default name.', '仅修改显示名称，调用与额度仍使用原始 ID；清空别名可恢复默认名称。')),
+          h('label', { style: { display: 'grid', gap: 6 } }, t('Provider alias', '分组别名'),
+            h('input', { 'aria-label': t('Provider alias', '分组别名'), maxLength: 80, value: providerName, placeholder: 'Antigravity', onChange: (e) => setProviderName(e.target.value) })),
+          h('div', { style: { display: 'grid', gap: 12, maxHeight: 320, overflowY: 'auto', margin: '12px 0' } }, rows.map((model) =>
+            h('label', { key: model.id, style: { display: 'grid', gap: 6, minWidth: 0 } },
+              h('code', { style: { overflowWrap: 'anywhere' } }, model.id),
+              h('input', { 'aria-label': `${t('Model alias', '模型别名')} ${model.id}`, maxLength: 80,
+                value: Object.prototype.hasOwnProperty.call(names, model.id) ? names[model.id] : '', placeholder: model.name || model.id,
+                onChange: (e) => setNames({ ...names, [model.id]: e.target.value }) })))),
+          error ? h('p', { role: 'alert', style: { color: '#d9534f' } }, error) : null,
+          h('div', { className: 'dsh-agy-stack', style: { gap: 8, justifyContent: 'flex-end' } },
+            h('button', { type: 'button', className: 'dsh-agy-btn', onClick: () => { setProviderName(''); setNames({}) } }, t('Reset aliases', '重置别名')),
+            h('button', { type: 'button', className: 'dsh-agy-btn', onClick: () => setEditing(false) }, t('Cancel', '取消')),
+            h('button', { type: 'button', className: 'dsh-agy-btn', disabled: busy, onClick: () => void save() }, busy ? '…' : t('Save aliases', '保存别名')))) : null)
+    }
+
     function SettingsCard(props) {
       const [status, setStatus] = React.useState(null)
       const [error, setError] = React.useState(null)
@@ -2034,6 +2088,7 @@ window.__ModuleLoader__.load({
               onChange: (v) => void applyPatch({ longDecodeContinuations: v }),
             }))
             : null,
+          status ? h(DisplayAliases, { status, client: props.client, onStatus: adoptStatus }) : null,
           // Provider-level allowlist: the same block the Models page card renders.
           status ? h(MS.ModelSelectionBlock, {
             adapter: antigravityModelAdapter(props.client),

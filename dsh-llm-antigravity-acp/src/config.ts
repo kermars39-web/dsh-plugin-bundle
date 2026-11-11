@@ -48,8 +48,10 @@ export interface AccountProfile {
 export interface Config {
   /** Provider route id shown in the model picker. */
   provider: string
-  /** Display name of the provider group. */
-  displayName: string
+  /** Presentation-only provider group alias; empty uses Antigravity. */
+  displayName: Volatile<string>
+  /** Presentation-only names keyed by canonical model id. */
+  modelDisplayNames: Volatile<Record<string, string>>
   /** Absolute path of the `agy` executable; empty resolves `~/.local/bin/agy`, then `agy` on PATH. */
   command: string
   /** Isolated Antigravity home for ACP sessions; empty uses `$DSH_HOME/cache/antigravity-acp`. */
@@ -106,7 +108,8 @@ function maybeVolatile<T>(schema: T): T {
 /** Configuration schema. */
 export const Config: z<Config> = z.object({
   provider: z.string().default('antigravity'),
-  displayName: z.string().default('Antigravity'),
+  displayName: maybeVolatile(z.string().default('Antigravity')),
+  modelDisplayNames: maybeVolatile(z.dict(z.string()).default({})),
   command: z.string().default(''),
   home: z.string().default(''),
   contextWindow: maybeVolatile(z.number().step(1).min(0).default(0)),
